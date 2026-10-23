@@ -134,7 +134,7 @@ powershell -File packages\memory\dsh-mem.ps1 search 记忆
 
 ## 许可与署名
 
-MIT。作者：**小易**。
+MIT。作者：**小易** <img src="assets/blue-fish.jpg" width="56" alt="蓝色大肥鱼" title="蓝色大肥鱼（DeepSeek）">
 
 ---
 
