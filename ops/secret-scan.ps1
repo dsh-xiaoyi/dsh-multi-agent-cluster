@@ -77,7 +77,10 @@ foreach ($f in $targets) {
   # skip self
   if ([System.IO.Path]::GetFullPath($f.FullName) -eq $selfPath) { continue }
   $n = 0
-  try { $content = Get-Content $f.FullName -ErrorAction Stop } catch { continue }
+  # 2026-10-24: 必须按 **UTF-8** 读，不能依赖 BOM。
+  # 之前用 Get-Content 读无 BOM 的 UTF-8 文件时会被当成 ANSI/GBK，
+  # 中文与相邻 ASCII 被错配 ⇒ 明明有问题的文件被判 CLEAN（实测踩到：CI 报 BLOCK，本地却 CLEAN）。
+  try { $content = (([System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)) -split "`r?`n") } catch { continue }
   foreach ($line in $content) {
     $n++
     foreach ($r in $rules) {
