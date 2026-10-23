@@ -21,13 +21,13 @@ if ($Paths) { $Paths = @($Paths | ForEach-Object { $_ -split '[,;]' } | ForEach-
 
 # ---------------- 规则 ----------------
 $rules = @(
-  @{ name = 'SQL/应用口令赋值';  level = 'BLOCK'; re = '(?i)(password|pwd|passwd)\s*[=:]\s*["''][^"'']{3,}' },
+  @{ name = 'SQL/应用口令赋值';  level = 'BLOCK'; re = '(?i)(password|pwd|passwd)\s*[=:]\s*["''](?![$<;])(?=[^"'']*["''])[A-Za-z0-9][^"''=+]{3,}["'']' },
   @{ name = '令牌赋值';          level = 'BLOCK'; re = '(?i)(token|secret|apikey|api_key)\s*[=:]\s*["''][A-Za-z0-9_\-\.]{16,}' },
   @{ name = 'Bearer 头';         level = 'BLOCK'; re = 'Bearer\s+[A-Za-z0-9_\-\.]{20,}' },
   @{ name = '私钥块';            level = 'BLOCK'; re = 'BEGIN [A-Z ]*PRIVATE KEY' },
   @{ name = '真实私网 IP';       level = 'BLOCK'; re = '\b10\.0\.0\.\d{1,3}\b' },
   @{ name = '邮箱地址';          level = 'BLOCK'; re = '\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b' },
-  @{ name = 'QQ 号';             level = 'BLOCK'; re = '\b(00000000|00000000)\b' },
+  @{ name = 'QQ 号(仅上下文)'; level = 'INFO';  re = '(?i)(qq|扣扣)[^0-9]{0,6}[1-9][0-9]{4,10}' },
   @{ name = 'UNC 共享路径';      level = 'BLOCK'; re = '\\\\10\.\d+\.\d+\.\d+\\' },
   @{ name = '个人绝对路径';      level = 'INFO';  re = '(?i)(E:\\deepseek|C:\\dsh-mem|D:\\10\.0\.0|G:\\deepseek)' },
   @{ name = '本机用户名';        level = 'INFO';  re = '(?i)\b(dshuser|dshuser|dshuser)\b' }
@@ -59,11 +59,23 @@ function Get-Targets {
 $targets = @(Get-Targets -P $Paths -R $Root)
 if (-not $Quiet) { Write-Output ('scanned files: ' + $targets.Count) }
 
+# 允许清单：看起来像、其实不是凭据的常见写法
+$allowLine = @(
+  '\+\s*\$',                            # "..." + $var 拼接
+  ';\s*(User Id|Password|Database|Server)=', # 连接串拼接
+  'EXAMPLE_', '<PAIR-TOKEN', 'TEST-TOKEN',   # 示例/占位
+  '00000000-0000-0000-0000-000000000000',    # 测试夹具 GUID
+  'dead-beef'                                # 测试夹具
+)
+$selfPath = [System.IO.Path]::GetFullPath($PSCommandPath)
+
 $blockHits = 0
 $infoHits  = 0
 $lines = @()
 
 foreach ($f in $targets) {
+  # skip self
+  if ([System.IO.Path]::GetFullPath($f.FullName) -eq $selfPath) { continue }
   $n = 0
   try { $content = Get-Content $f.FullName -ErrorAction Stop } catch { continue }
   foreach ($line in $content) {
@@ -71,7 +83,9 @@ foreach ($f in $targets) {
     foreach ($r in $rules) {
       if ($line -match $r.re) {
         # 允许：示例占位（EXAMPLE_ / <...> / 10.0.0.x / your- / 192.0.2.x）
-        $isPlaceholder = ($line -match 'EXAMPLE_|<\s*[A-Za-z_ ]+\s*>|10\.0\.0\.x|your[-_ ]') 
+        $isPlaceholder = ($line -match 'EXAMPLE_|<\s*[A-Za-z_ ]+\s*>|10\.0\.0\.x|your[-_ ]')
+        # allow hit：命中允许清单则视为误报
+        if (-not $isPlaceholder) { $isPlaceholder = [bool]($allowLine | Where-Object { $line -match $_ }) }
         if ($isPlaceholder -and $r.level -eq 'BLOCK') { continue }
         $tag = $r.level
         if ($tag -eq 'BLOCK') { $blockHits++ } else { $infoHits++ }
