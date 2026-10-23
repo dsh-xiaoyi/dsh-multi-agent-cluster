@@ -50,6 +50,15 @@ docs\              00-why / 01-architecture / 02-memory-design / 03-conventions
 ```
 
 
+## 环境要求
+
+```
+PowerShell 5.1+（Windows 10 / 11 / Server 2016 及以上系统自带）
+Node.js（只有注入插件需要）
+SQL Server（Express 免费版即可）—— 建表时需要一次 sysadmin
+Windows 7 用户：需先装 WMF 5.1（系统自带的是 PowerShell 2.0），否则脚本无法运行
+```
+
 ## 5 分钟跑起来（单机最小闭环）
 
 ```powershell
