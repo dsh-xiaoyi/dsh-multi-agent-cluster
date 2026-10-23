@@ -1,0 +1,4 @@
+{
+  "NODE-B": { "url": "http://192.0.2.17:19387", "path": "/agent/inbox", "token": "EXAMPLE_TOKEN_0000000000" },
+  "NODE-C": { "url": "http://192.0.2.18:19387", "path": "/agent/inbox", "token": "EXAMPLE_TOKEN_0000000000" }
+}

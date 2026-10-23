@@ -1,0 +1,30 @@
+{
+  "name": "dsh-agent-bridge",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.mjs",
+  "description": "Cross-machine agent messaging for the DSH fleet (plan B1): one authenticated HTTP route on the relay host, local injection via ctx.subagents.prompt with queue/steer delivery. Prototype.",
+  "exports": {
+    ".": "./index.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "agent-bridge",
+    "cross-machine",
+    "orchestrator"
+  ],
+  "license": "MIT"
+}

@@ -1,0 +1,29 @@
+# 凭据与秘密 —— 永远不要提交
+*.token
+*peers*.json
+!examples/peers.example.json
+*config.json
+!examples/config.example.json
+.credentials.yaml
+*.pfx
+*.key
+*.pem
+
+# 运行产物
+logs/
+outbox/
+*.log
+*.bak
+*.bak-*
+*.7z
+*.zip
+
+# 记忆库数据导出（绝不入库）
+*-backup-*.json
+replica*.json
+
+# 工具目录
+node_modules/
+_tmp/
+_share/
+.vscode/

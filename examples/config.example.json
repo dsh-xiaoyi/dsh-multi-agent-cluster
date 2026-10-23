@@ -1,0 +1,9 @@
+{
+  "server": "192.0.2.11,1433",
+  "database": "DSHMemory",
+  "user": "dsh_app",
+  "password": "EXAMPLE_PASSWORD",
+  "machine": "NODE-A",
+  "replicaPath": "C:\\dsh-mem\\dsh-mem-replica.json",
+  "cliPath": "C:\\dsh-mem\\dsh-mem.ps1"
+}
