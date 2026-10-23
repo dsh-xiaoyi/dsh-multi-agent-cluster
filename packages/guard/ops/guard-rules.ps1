@@ -5,7 +5,7 @@
 # no database it must fall back to the central commander (中枢) for centrally issued rules.
 #
 # Rule sources, in order:
-#   1) DB          dbo.guard_rules (enabled=1)         -- normal fleet operation
+#   1) DB          dbo.guard_rules (enabled=1)         -- normal cluster operation
 #   2) local file  <root>\ops\guard-rules.json         -- no DB, rules shipped with the installer
 #   3) commander   http://<中枢>:19387/rules           -- no DB and no local rules: ask 青鸟
 #

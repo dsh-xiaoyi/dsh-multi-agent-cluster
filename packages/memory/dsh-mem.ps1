@@ -107,10 +107,10 @@ $CfgPath = Join-Path $Root 'dsh-mem.config.json'
 if (-not (Test-Path -LiteralPath $CfgPath)) { throw "config not found: $CfgPath" }
 $cfg = Read-TextFile $CfgPath | ConvertFrom-Json
 
-# --- explicit version, so the fleet never has to infer it from a byte count again ------------
+# --- explicit version, so the cluster never has to infer it from a byte count again ------------
 # Lineage: 32174 (prune/handoff) -> 53025 (offline replica) -> 74605 (recall + embed half)
 #          -> 77609 (path b: vectors keyed by content hash) -> 80330 (3 defects fixed)
-#          -> 81395 (duplicate consolidation, fleet audit) -> 1.0.0 (UNIFIED baseline:
+#          -> 81395 (duplicate consolidation, cluster audit) -> 1.0.0 (UNIFIED baseline:
 #             export redaction on handoff/backup/replica + this version report + check 14).
 # Memory [177]/[178] is what happens without this string: two machines compared byte counts,
 # both read a stale number, and the direction of the fix was reported backwards.
@@ -1387,7 +1387,7 @@ WHERE e.model = @model AND e.item_type = 'message'
       # Consolidate to ONE vector per (model, item_type, text_hash): prefer a row whose target
       # is live, else the newest.  The earlier version dropped only ORPHAN duplicates, so
       # 17 groups of legacy "live row + live row, same content" survived -- found by the
-      # fleet audit 2026-10-06 (44 vectors / 27 redundant), which also produced duplicate
+      # cluster audit 2026-10-06 (44 vectors / 27 redundant), which also produced duplicate
       # ranking lines.  Content is what `recall` resolves on, so one vector per hash is enough.
       $deduped = Invoke-Exec -Sql @"
 ;WITH r AS (
@@ -1569,7 +1569,7 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
   }
 
   'roster' {
-    # cli_version turns this from a presence list into a fleet VERSION check: three machines
+    # cli_version turns this from a presence list into a cluster VERSION check: three machines
     # reporting the same string is the thing [177]/[178] tried to establish from byte counts.
     $m = Invoke-Rows -Sql "SELECT login_name, machine, purpose, first_seen, last_seen, cli_version FROM dbo.machines ORDER BY login_name"
     Write-Host ("== 记忆库成员 " + @($m).Count + " 个 ==")
@@ -1584,16 +1584,16 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
     # all machines that report a version must agree, otherwise say so loudly
     $uniq = @($seen | Select-Object -Unique)
     if ($uniq.Count -gt 1) {
-      Write-Host ("  WARN: fleet versions differ -> " + ($uniq -join ', ') + "   (this machine: " + $script:CliVersion + ")")
+      Write-Host ("  WARN: cluster versions differ -> " + ($uniq -join ', ') + "   (this machine: " + $script:CliVersion + ")")
     } elseif ($uniq.Count -eq 1) {
-      Write-Host ("  fleet cli version: " + $uniq[0] + $(if ($uniq[0] -eq $script:CliVersion) { "  (this machine agrees)" } else { "  WARN: this machine is " + $script:CliVersion }))
+      Write-Host ("  cluster cli version: " + $uniq[0] + $(if ($uniq[0] -eq $script:CliVersion) { "  (this machine agrees)" } else { "  WARN: this machine is " + $script:CliVersion }))
     }
   }
 
   'version' {
-    # One string that identifies the whole script, so the fleet stops guessing from byte counts.
+    # One string that identifies the whole script, so the cluster stops guessing from byte counts.
     # It is also reported into dbo.machines on every run that touches the DB (Register-Host),
-    # which is what makes 'roster' a fleet-wide version check (memory [177]/[178] is why).
+    # which is what makes 'roster' a cluster-wide version check (memory [177]/[178] is why).
     $vFile = $PSCommandPath
     if (-not $vFile) { $vFile = Join-Path $Root 'dsh-mem.ps1' }
     $vLen = (Get-Item -LiteralPath $vFile).Length
@@ -1603,7 +1603,7 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
     Write-Host ("  size    : " + $vLen + " bytes   sha256[0..15] " + $vSha)
     Write-Host ("  limits  : " + (($script:ColLimits.Keys | ForEach-Object { $_ + " " + $script:ColLimits[$_] }) -join ' / ') + "  (mirror dbo.memories; guard check 15 enforces the boundary)")
     Write-Host ("  server  : " + $cfg.server + " / " + $script:Db)
-    Write-Host  "  fleet   : run 'roster' to see the version each machine reports in dbo.machines"
+    Write-Host  "  cluster   : run 'roster' to see the version each machine reports in dbo.machines"
   }
 
   'handoff' {

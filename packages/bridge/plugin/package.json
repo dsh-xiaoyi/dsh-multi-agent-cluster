@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "main": "index.mjs",
-  "description": "Cross-machine agent messaging for the DSH fleet (plan B1): one authenticated HTTP route on the relay host, local injection via ctx.subagents.prompt with queue/steer delivery. Prototype.",
+  "description": "Cross-machine agent messaging for the DSH cluster (plan B1): one authenticated HTTP route on the relay host, local injection via ctx.subagents.prompt with queue/steer delivery. Prototype.",
   "exports": {
     ".": "./index.mjs",
     "./cordis.patch.yml": "./cordis.patch.yml",

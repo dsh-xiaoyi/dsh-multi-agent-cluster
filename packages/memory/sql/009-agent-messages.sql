@@ -9,7 +9,7 @@
 --   Net effect: cross-machine agent messaging with zero new listening surface.
 --
 -- GUARANTEES
---   * append-only for the fleet logins: INSERT + SELECT + UPDATE(delivered_at) only, no DELETE
+--   * append-only for the cluster logins: INSERT + SELECT + UPDATE(delivered_at) only, no DELETE
 --   * msg_id is the primary key -> a replayed enqueue cannot duplicate a message
 --   * body is the message text; keep it OUT of logs and OUT of dbo.memories (trajectory only)
 --

@@ -1,6 +1,6 @@
 // dsh-agent-bridge — host half (prototype v0.1.0)
 //
-// PLAN B (B1): cross-machine agent messaging for the DSH fleet. Only the relay host
+// PLAN B (B1): cross-machine agent messaging for the DSH cluster. Only the relay host
 // (the hub node) opens a LAN port; the other machines may still receive because they run this same
 // plugin and each injects LOCALLY.
 //
@@ -56,17 +56,17 @@ function normConfig(config = {}) {
     // so it never sits in a world-readable profile config (R46).
     tokenFile: typeof config.tokenFile === 'string' ? config.tokenFile : '',
     // OWN ON-DISK LOG, and why it is not optional:
-    // this fleet already lost time to "installed but ineffective" — a plugin that never
+    // this cluster already lost time to "installed but ineffective" — a plugin that never
     // loaded reports nothing and simply does nothing. Per the owner's measured note
     // (dsh-memory-bridge/README-插件热重载行为.md) a plugin must leave a file marker, so
     // "armed" here is the only trustworthy proof that apply() actually ran in the host.
     logPath: typeof config.logPath === 'string' ? config.logPath : '',
     localTargets: config.localTargets && typeof config.localTargets === 'object' ? config.localTargets : {},
-    // SENDER whitelist (default-deny). The fleet is MUTUAL (owner, 2026-10-12): 11, 17 and 18 may
+    // SENDER whitelist (default-deny). The cluster is MUTUAL (owner, 2026-10-12): 11, 17 and 18 may
     // each inject into the others. An empty/absent list means "refuse everything", never "allow all".
     // R49(1) support, staged: a per-peer token map. When configured, the SENDER IS DERIVED FROM
     // THE TOKEN (never from the request body), which is what the rule actually requires. Left
-    // empty until the fleet lays out per-peer tokens, so nothing changes today.
+    // empty until the cluster lays out per-peer tokens, so nothing changes today.
     peerTokens: config.peerTokens && typeof config.peerTokens === 'object' ? config.peerTokens : {},
     // Same principle as tokenFile (R46): the per-peer tokens live in an ACL-tight FILE produced from
     // the vault, never in this config. Format: {"<peer>":"<token>", ...}

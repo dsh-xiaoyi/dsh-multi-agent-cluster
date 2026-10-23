@@ -1,6 +1,6 @@
 -- 004-messages-no-unarchived-delete.sql
 -- PHASE 3 of "memory with time": make it IMPOSSIBLE to destroy a message row that has no copy in
--- the append-only archive.  Database-side, host-side, no CLI change, no fleet rollout.
+-- the append-only archive.  Database-side, host-side, no CLI change, no cluster rollout.
 --
 -- WHY THIS AND NOT "DENY DELETE ON dbo.messages":
 --   sync must still remove rows the session log no longer has (that is how the current table keeps

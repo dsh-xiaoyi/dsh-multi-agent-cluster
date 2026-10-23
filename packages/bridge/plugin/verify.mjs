@@ -1,7 +1,7 @@
 // verify.mjs — exercises dsh-agent-bridge against a FAKE ctx. No DSH restart, no network,
 // no database, no files written. This is the same testing shape the owner's
 // dsh-memory-bridge uses (see its verify.mjs), and it exists because "installed but
-// ineffective" has burned this fleet before.
+// ineffective" has burned this cluster before.
 //
 //   node verify.mjs        exit 0 = all pass, 1 = an assertion failed
 //

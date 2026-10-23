@@ -14,7 +14,7 @@
       name: dsh-agent-bridge
       config:
         path: /agent/inbox
-        # SENDER whitelist (default-deny): the fleet is MUTUAL - 11, 17 and 18 may each send
+        # SENDER whitelist (default-deny): the cluster is MUTUAL - 11, 17 and 18 may each send
         # to the others (owner's decision, recorded in [12071], supersedes the only-11 round).
         allowedFrom:
           # 2026-10-22 规范化：库内权威机器名（大小写敏感）
@@ -33,7 +33,7 @@
           '11/selftest':
             parentSessionId: 'session-a3b14127-d25b-42fd-9989-55b3a48296ef'
             childSessionId: 'fe79a3f0-cb1e-4ffd-9c95-8c63045c6e61'
-          # ---- 2026-10-13: a properly NAMED fleet inbox so peers can address each other by convention
+          # ---- 2026-10-13: a properly NAMED cluster inbox so peers can address each other by convention
           # ('<COMPUTERNAME>/agent-1' style) instead of the historical '11/selftest' name.
           # Same (parent,child) pair as 11/selftest: both names hit the same live continuable child.
             # 2026-10-22: IP 作为传输层标识（稳定、大小写无关、无 CJK 编码风险）
