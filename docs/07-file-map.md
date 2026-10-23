@@ -27,6 +27,7 @@
 | `06-rescue.md` | DSH 改坏了怎么查、R1–R5 回滚剧本 |
 | `winrm.md` | WinRM 基线（跨机管理） |
 | `07-file-map.md` | 本页 |
+| `08-permissions-and-antivirus.md` | 权限要求 + 安全软件拦截怎么处理 |
 
 ## `ops/` —— 安装与工具（拿起来就能用）
 

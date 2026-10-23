@@ -80,6 +80,30 @@ powershell -File packages\memory\dsh-mem.ps1 search 记忆
 
 > 说明：根 `ops\` 是"安装与工具"，`packages\guard\ops\` 是"守卫运行时脚本"，两者职责不同。
 
+## 权限要求 & 安全软件拦截（很常见，先看这段）
+
+```
+需要的权限（最小化）：
+  建表/建库    → SQL sysadmin（一次性；之后日常只用普通账号）
+  日常读写记忆 → 普通 SQL 登录（db_datareader / db_datawriter）
+  装注入插件   → 对 ~/.dsh/profiles/.../node_modules 有写权限（mklink 可能还要管理员）
+  定时任务     → 管理员（备份、心跳、巡检）
+  青鸟监听端口 → 普通权限即可（>1024）；若开防火墙需放行内网端口
+
+会被安全软件拦的动作（360 / Defender 都可能）：
+  · PowerShell 启 PowerShell（子进程）→ 把「仓库目录」加入信任区/白名单
+  · mklink 建链接                     → 用管理员运行一次，或改用复制目录
+  · 注册计划任务                      → 以管理员运行安装脚本
+  · 首次监听端口                      → 只允许"专用网络/内网"，不要放行公网
+  · .ps1 直接双击                     → 用 powershell -ExecutionPolicy Bypass -File
+
+我们不会做、也请别做：
+  × 关杀毒 / 关 UAC / 关防火墙   × 写"杀不掉"的内核驱动   × 改系统安全策略
+  ⇒ 加白名单的正确做法是"把目录加进信任区"，不是"关掉防护"。
+```
+
+详见 [docs/08-permissions-and-antivirus](docs/08-permissions-and-antivirus.md)。
+
 ## 边界（说清楚，避免误解）
 
 - 记忆库里的**数据不随仓库发布**；仓库只有结构与代码。
