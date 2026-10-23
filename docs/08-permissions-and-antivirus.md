@@ -74,3 +74,41 @@ sqlcmd -E -d DSHMemory -i .\packages\memory\sql\001-create-embeddings.sql
 
 每一步失败时，**先看它打印的失败原因**（本项目的脚本都会明确说出为什么失败），
 再去加白名单或补权限 —— 不要一上来就把所有防护关掉。
+
+## 四、如果组名被改过：请**用 SID 判断权限**（很重要）
+
+有些人会把系统里的组名"对调"来做防御（例如把 `Administrators` 改名为 `Y`，把 `Guests` 改名为 `Administrators`）。
+这个办法很聪明，但会让"按名字判断权限"的脚本得出**完全相反**的结论：
+
+- 你以为把账号加进 `Administrators` 就给了管理员 → 实际加进了**来宾组**，权限一点没给
+- 你以为 `BUILTIN\Administrators` 是管理员组 → 实际它是来宾组
+- 你以为 `C:\Users\dsy` 属于账号 `dsy` → 实际可能属于另一个账号（目录名不随改名变化）
+
+正确做法是**按 SID 判断**，或直接用 .NET 的 `IsInRole`（它内部就是按 SID）：
+
+```powershell
+# (1) 判断当前是否管理员：IsInRole 内部用 SID S-1-5-32-544，组名改成什么都无所谓
+$id = [Security.Principal.WindowsIdentity]::GetCurrent()
+$isAdmin = (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+# (2) 想知道"真正的管理员组"在这台机器上叫什么名字
+([Security.Principal.SecurityIdentifier]'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value
+
+# (3) 想给某账号管理员权限：先按 SID 解析组名，再加（不要硬编码 "Administrators"）
+$adminsName = ([Security.Principal.SecurityIdentifier]'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value
+net localgroup "$adminsName" <账号> /add
+```
+
+### 两个相关事实（省得白费功夫）
+
+```
+① 用户目录名不随账号改名而变
+   目录归属按 SID 记在 HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList
+   所以 C:\Users\dsy 可能属于别的账号；要确认就跑一次 ProfileList 对照 SID
+
+② RID 改不了
+   内置 Administrator 是 RID 500，后建的账号是 1001 起。**没有受支持的方法**把普通管理员"提升"成 RID 500。
+   少数老软件要求 500 时，正确做法是"启用内置管理员 → 只用它跑那个软件 → 用完禁用"，
+   而不是把日常账号迁移过去。另外若 `FilterAdministratorToken=1`，连 RID 500 也会被 UAC 过滤 —— 迁了也没用。
+```
+
