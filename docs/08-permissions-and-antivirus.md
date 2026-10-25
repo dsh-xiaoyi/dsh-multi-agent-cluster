@@ -82,7 +82,7 @@ sqlcmd -E -d DSHMemory -i .\packages\memory\sql\001-create-embeddings.sql
 
 - 你以为把账号加进 `Administrators` 就给了管理员 → 实际加进了**来宾组**，权限一点没给
 - 你以为 `BUILTIN\Administrators` 是管理员组 → 实际它是来宾组
-- 你以为 `C:\Users\dsy` 属于账号 `dsy` → 实际可能属于另一个账号（目录名不随改名变化）
+- 你以为 `C:\Users\<用户名>` 属于账号 `<用户名>` → 实际可能属于另一个账号（目录名不随改名变化）
 
 正确做法是**按 SID 判断**，或直接用 .NET 的 `IsInRole`（它内部就是按 SID）：
 
@@ -104,7 +104,7 @@ net localgroup "$adminsName" <账号> /add
 ```
 ① 用户目录名不随账号改名而变
    目录归属按 SID 记在 HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList
-   所以 C:\Users\dsy 可能属于别的账号；要确认就跑一次 ProfileList 对照 SID
+   所以 C:\Users\<用户名> 可能属于别的账号；要确认就跑一次 ProfileList 对照 SID
 
 ② RID 改不了
    内置 Administrator 是 RID 500，后建的账号是 1001 起。**没有受支持的方法**把普通管理员"提升"成 RID 500。

@@ -61,9 +61,16 @@ const fakeCtx = {
 // ★ 关键: cliPath 指向一个不存在的路径 ⇒ 捕获流程会被触发，但【写不进数据库】
 const probeLog = join(tmpdir(), 'dsh-memory-bridge-verify.log')
 try { rmSync(probeLog, { force: true }) } catch (e) { }
+// ★ 2026-10-25 FIX: 原来这里故意给一个"不存在的 cliPath"，指望插件不去真写库。
+//   但旧版插件在"配置了但不存在"时会回退到候选里真实存在的 dsh-mem.ps1 ——
+//   结果: ① 自测永远 FAIL(6)（真 CLI 写库要 1-2 秒，超过 3 秒等待窗口）；
+//         ② 假数据被写进真实记忆库（实测产生 18 条 kind=llm-call 的假记录）。
+//   现在改用"存在的快速 stub"，插件会立刻拿到 exit 码、且不会碰任何数据库。
+const stubCli = join(tmpdir(), 'dsh-mem-verify-noop-stub.ps1')
+writeFileSync(stubCli, ['$ErrorActionPreference = "SilentlyContinue"', 'exit 0'].join('\r\n'), 'utf8')
 const disposer = mod.apply(fakeCtx, {
   replicaPath,
-  cliPath: 'C:\\__verify_no_such_dir__\\dsh-mem.ps1',
+  cliPath: stubCli,
   logPath: probeLog,
   localProviders: ['ollama-local'],
   callLogFlushMs: 150,
@@ -172,7 +179,7 @@ await new Promise((r) => setTimeout(r, 2500))
 
 let logText = ''
 try { logText = readFileSync(probeLog, 'utf8') } catch (e) { }
-const captures = (logText.match(/capture checkpoint/g) || []).length
+const captures = (logText.match(/capture (?:checkpoint|evidence)/g) || []).length
 console.log('capture 日志行数 = ' + captures + '（应为 1: 摘要被捕获、普通消息不算、重复被去重）')
 for (const l of logText.split('\n').filter(Boolean)) console.log('  | ' + l)
 
@@ -274,7 +281,7 @@ let encodingOK = false
     encodingOK = true
   }
   if (typeof dispose2 === 'function') dispose2()
-  try { rmSync(stubPath, { force: true }); rmSync(argsPath, { force: true }) } catch (e) { }
+  try { rmSync(stubPath, { force: true }); rmSync(argsPath, { force: true }); rmSync(stubCli, { force: true }) } catch (e) { }
 }
 
 try { rmSync(probeLog, { force: true }) } catch (e) { }

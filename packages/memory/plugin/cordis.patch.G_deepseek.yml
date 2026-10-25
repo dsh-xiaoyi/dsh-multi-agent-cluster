@@ -1,0 +1,18 @@
+# dsh-memory-bridge 组合包层（bundle layer）。
+#
+# package.json 里声明 dsh.bundle.patch 指向本文件，因此：
+#   dsh plugin --profile <name> add dsh-memory-bridge
+# 安装后本包会被收进该 profile 的层列表，下面的 insert 把插件挂进组合树。
+#
+# config 里是本机的路径 —— 每台机器不一样（本机是 G:\deepseek\，
+# 另外两台是 C:\dsh-mem\）。用户层 patch 可按 id 覆盖本行的 config。
+- insert:
+    - id: dsh-memory-bridge
+      name: dsh-memory-bridge
+      config:
+        replicaPath: 'G:\deepseek\dsh-mem-replica.json'
+        cliPath: 'G:\deepseek\dsh-mem.ps1'
+        limit: 8
+        maxChars: 16000          # 2026-10-24: 2400 太小，会把活动段/定义型记忆整段截掉
+        conventionsMax: 8000      # 关键约定单独限长，超出时标注'已截断'
+        refreshMs: 60000

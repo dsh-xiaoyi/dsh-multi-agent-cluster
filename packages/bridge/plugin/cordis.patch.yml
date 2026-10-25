@@ -23,7 +23,7 @@
           - 'NODE-C'
           # 历史别名（兼容旧消息，勿再新增使用）
           - 'node-b'
-          - 'WIN-NGHIO1UA4GT'
+          - '<agent-host>'
         token: ''
         tokenFile: 'C:\dsh-mem\agent-bridge.token'
         # R49(1) ACTIVE 2026-10-13: per-peer tokens from the ACL-tight file (never from config; R46).

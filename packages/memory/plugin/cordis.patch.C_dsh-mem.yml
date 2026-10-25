@@ -1,0 +1,20 @@
+# dsh-memory-bridge 组合包层 —— ★ 这是【另外两台机器】用的版本
+# 本机路径与存储节点不同：CLI 与副本都在 C:\dsh-mem\ 下。
+#
+# 安装步骤（每台自己做）:
+#   1. 把 dsh-memory-bridge 整个目录复制到本机，例如 C:\dsh-mem\dsh-memory-bridge
+#   2. 用 dsh CLI 装进 desktop profile:
+#        dsh plugin --profile desktop add "link:C:\dsh-mem\dsh-memory-bridge"
+#   3. 重启 DSH（新插入的 bundle 条目在重启前是 inactive —— 已实测确认）
+#   4. 验证: 在浏览器开一个全新会话，问"你知道我们在做什么吗"
+#      如果它答得出三台机器共享记忆里的事，说明注入生效
+- insert:
+    - id: dsh-memory-bridge
+      name: dsh-memory-bridge
+      config:
+        replicaPath: 'C:\dsh-mem\dsh-mem-replica.json'
+        cliPath: 'C:\dsh-mem\dsh-mem.ps1'
+        limit: 8
+        maxChars: 16000          # 2026-10-24: 2400 太小，会把活动段/定义型记忆整段截掉
+        conventionsMax: 8000      # 关键约定单独限长，超出时标注'已截断'
+        refreshMs: 60000

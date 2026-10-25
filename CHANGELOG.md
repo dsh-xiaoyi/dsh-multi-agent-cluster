@@ -1,5 +1,20 @@
 # 变更记录
 
+## [0.5.1] — 2026-10-25（memory 插件升级）
+### 修复（发布前自测拦下的两个真问题）
+
+- `packages/memory/plugin` 同步了 0.5.1 的两处修复：
+  **显式 `cliPath` 缺失不再静默回退**（记 `CLI-MISSING`、拒绝执行）+
+  **`verify.mjs` 改用临时 no-op stub CLI**（自测稳定 PASS，且不再写任何数据库）。
+- 补齐了 `package.json` 里 `files` 清单缺失的 4 个文件（否则 `npm pack` 出来的包不完整）。
+
+
+- `packages/memory/plugin` 升级到 **dsh-memory-bridge 0.5.1**：新增
+  **state card**（跨会话工作状态）与 **anchor 指针**（可回读的 session+seq）两段注入，
+  `SEC_BUDGET`/`BUDGET_FLOOR` 随之再平衡（state 2400 / anchor 900，各段设下限）。
+- 对外示例已脱敏：默认 `ollamaUrl` 改为 `127.0.0.1`，文案不再含具体主机名/GPU 型号；
+  文档中的示例路径统一为 `C:\Users\<用户名>`；`packages/bridge/plugin/cordis.patch.yml`
+  的白名单示例主机名改为 `<agent-host>`。
 ## v0.1.0 (2026-10-23) — 首发（experimental）
 
 ### 新增
