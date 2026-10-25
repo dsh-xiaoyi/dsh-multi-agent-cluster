@@ -76,6 +76,7 @@ writeFileSync(stubCli, ['$ErrorActionPreference = "SilentlyContinue"', 'exit 0']
 const disposer = mod.apply(fakeCtx, {
   replicaPath,
   cliPath: stubCli,
+  spoolCapture: false,
   logPath: probeLog,
   localProviders: ['ollama-local'],
   callLogFlushMs: 150,
@@ -264,6 +265,7 @@ let encodingOK = false
   const dispose2 = mod.apply(encCtx, {
     replicaPath,
     cliPath: stubPath,
+    spoolCapture: false,
     logPath: join(tmpdir(), 'dsh-mem-verify-enc.log'),
     machine: 'NODE-A',
   })

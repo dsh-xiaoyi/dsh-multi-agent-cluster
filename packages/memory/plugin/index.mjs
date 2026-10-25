@@ -47,7 +47,7 @@ import os, { tmpdir } from 'node:os'   // 2026-10-25 修：之前只取了 tmpdi
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export const VERSION = '0.5.3'
+export const VERSION = '0.5.4'
 export const name = 'dsh-memory-bridge'
 export const inject = ['systemPrompt']
 
@@ -892,13 +892,55 @@ export function apply(ctx, config) {
       const spoolMaxBytes = Number(config.spoolMaxBytes || 33554432)
       const spoolTextMax = Number(config.spoolTextMax || 100000)
       try { mkdirSync(dirname(spoolPath), { recursive: true }) } catch (e) { /* already exists */ }
+
+      // 2026-10-25 (2nd pass): 第一版只用 firstText(event.data)，实测只捕获到 user/message
+      // （assistant / tool 的 data 形状不同，取不到 text ⇒ 被当成空事件丢掉）。
+      // 这里改成"多形状提取 + 兜底序列化"，保证四类事件都不丢；类型名原样记录，由导入端映射角色。
+      function spoolText(data, type) {
+        const cands = []
+        const push = (v) => { if (typeof v === 'string' && v.trim()) cands.push(v.trim()) }
+        try {
+          const blocks = []
+          if (Array.isArray(data && data.content)) blocks.push(...data.content)
+          if (data && data.message && Array.isArray(data.message.content)) blocks.push(...data.message.content)
+          if (Array.isArray(data && data.parts)) blocks.push(...data.parts)
+          for (const b of blocks) {
+            if (!b || typeof b !== 'object') continue
+            if (typeof b.text === 'string') push(b.text)
+            else if (typeof b.content === 'string') push(b.content)
+            else if (b.type === 'tool_result' && b.content) push(typeof b.content === 'string' ? b.content : JSON.stringify(b.content))
+          }
+        } catch (e) { /* ignore */ }
+        try { if (data && typeof data.content === 'string') push(data.content) } catch (e) { /* ignore */ }
+        try { push(data && data.text) } catch (e) { /* ignore */ }
+        try { if (typeof data === 'string') push(data) } catch (e) { /* ignore */ }
+        // 工具调用：名字 + 参数（arguments 常是 JSON 字符串）
+        try {
+          const name = (data && (data.name || data.tool || (data.message && data.message.name))) || ''
+          const args = (data && (data.arguments || data.args || (data.message && data.message.arguments))) || ''
+          if (name || args) {
+            const a = typeof args === 'string' ? args : JSON.stringify(args)
+            push('<tool ' + String(name || '?') + '> ' + String(a || ''))
+          }
+        } catch (e) { /* ignore */ }
+        const out = cands.filter(Boolean).join('\n')
+        if (out) return out
+        // 兜底：仍然序列化一份（截断），保证"这条事件发生过"能被看到，而不是静默丢弃
+        try {
+          const j = JSON.stringify(data === undefined ? null : data)
+          if (j && j !== 'null' && j !== '{}') return '[' + type + '] ' + j
+        } catch (e) { /* ignore */ }
+        return ''
+      }
+
       let spoolCount = 0
+      const typeCount = {}
       ctx.on('session/event', function (session, event) {
         try {
           if (!event || typeof event.type !== 'string') return
           const sid = String((session && session.id) || '?')
           const seq = Number(event.seq || 0)
-          const text = firstText(event.data)
+          const text = spoolText(event.data, event.type)
           if (!text) return
           const clipped = text.length > spoolTextMax ? text.slice(0, spoolTextMax) + '\n…[spool-trunc]' : text
           const rec = { ts: new Date().toISOString(), session: sid, seq: seq, type: event.type, text: clipped }
@@ -909,8 +951,9 @@ export function apply(ctx, config) {
           }
           appendFileSync(spoolPath, JSON.stringify(rec) + '\n', 'utf8')
           spoolCount++
+          typeCount[event.type] = (typeCount[event.type] || 0) + 1
           if (spoolCount === 1 || spoolCount % 200 === 0) {
-            log('SPOOL n=' + spoolCount + ' last=' + event.type + ' seq=' + seq + ' bytes=' + Buffer.byteLength(rec.text))
+            log('SPOOL n=' + spoolCount + ' types=' + JSON.stringify(typeCount) + ' last=' + event.type + ' seq=' + seq + ' bytes=' + Buffer.byteLength(rec.text))
           }
         } catch (err) {
           log('spool handler failed: ' + (err && err.message))

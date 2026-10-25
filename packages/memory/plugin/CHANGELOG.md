@@ -116,3 +116,11 @@ BUDGET_FLOOR shards 700 ｜ state 1200 ｜ anchor 350 ｜ recall 500 ｜ pinned 
 ### 修复：自测更严格
 - `verify.mjs` 的 mock ctx 由"只记一个 handler"改为"收集全部 handler 并逐个派发"
   （新增第二个 `session/event` 处理者后，旧 mock 会吞掉捕获处理器，造成 FAIL(8) 假红）
+## [0.5.4] — 2026-10-25（补全 spool 捕获）
+
+### 修复：spool 只捕获到 user/message
+- 第一版用单一提取器（只认 `data.content[].text`），实测 assistant / tool 事件取不到文本 ⇒ 被当空事件丢弃。
+- 现在多形状提取：`data.content[]` / `data.message.content[]` / `data.parts[]` 的 `text`，工具调用取
+  `name + arguments`，最后还有"序列化兜底"（保证事件不静默消失）。
+- 单元测试：6 个事件覆盖 user / assistant（含嵌套）/ tool/call / tool/result（块 + 字符串）→ 6/6 全部落盘。
+- `verify.mjs` 的两处 apply 显式 `spoolCapture: false`，自测不再往真实 spool 写（此前会留 `session-00000000-*` 噪音行）。
