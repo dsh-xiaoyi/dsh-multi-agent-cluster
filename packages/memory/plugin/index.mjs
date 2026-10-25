@@ -175,6 +175,8 @@ export function apply(ctx, config) {
   const conventionsDir = pickExisting(config.conventionsDir || 'C:\\dsh-mem\\conventions.d',
     PATH_CANDIDATES.map(function (d) { return d + '\\conventions.d' }), 'conventions.d') // 可选分片：按关键词命中才注入
   const injectLogPath = config.injectLogPath || 'C:\\dsh-mem\\logs\\inject.log'
+  // T17-B: core rules from dbo.guard_rules (tier='core' AND prompt_text NOT NULL)
+  const coreRulesPath = config.coreRulesPath || 'C:\\dsh-mem\\ops\\mem-core-rules.ps1'
   // 2026-10-24 C4：混合检索（本地嵌入 bge-m3 via 18 的 Ollama；失败自动退化为纯 IDF）
   const semanticOn    = config.semantic === false ? false : true
   const vectorPath    = config.vectorPath || 'C:\\dsh-mem\\mem-vectors.bin'
@@ -290,6 +292,49 @@ export function apply(ctx, config) {
       }
       const mems = Array.isArray(raw.memories) ? raw.memories.slice() : []
 
+      // T17-B: 运行时先读规则库（tier='core' AND prompt_text IS NOT NULL），拼进注入块
+      let coreRev = 0
+      let coreCount = 0
+      let coreExpect = 0
+      let coreGot = 0
+      let corePrompts = []
+      let coreErr = ''
+      let coreMs = 0
+      try {
+        if (config.coreRules === false) {
+          corePrompts = []
+        } else {
+          const coreOut = join(tmpdir(), 'dsh-mem-core-rules-' + process.pid + '.json')
+          let rr = null
+          for (let attempt = 1; attempt <= 2; attempt++) {
+            try { rmSync(coreOut, { force: true }) } catch (e) {}
+            const t0 = Date.now()
+            rr = spawnSync(powershell, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', coreRulesPath, '-Tier', 'core', '-OutFile', coreOut], { encoding: 'utf8', timeout: 30000 })
+            coreMs = Date.now() - t0
+            const okR = !!(rr && rr.status === 0 && existsSync(coreOut))
+            if (!okR) {
+              try {
+                log('INJECT-RULES-RETRY attempt=' + attempt + ' status=' + (rr && rr.status) + ' signal=' + (rr && rr.signal) + ' error=' + JSON.stringify(rr && rr.error ? String(rr.error.message || rr.error) : null) + ' elapsedMs=' + coreMs + ' ok=' + okR)
+              } catch (e) {}
+            }
+            if (okR) break
+            if (attempt < 2) {
+              try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000) } catch (e) {}
+            }
+          }
+          if (rr && rr.status === 0 && existsSync(coreOut)) {
+            const cj = JSON.parse(readFileSync(coreOut, 'utf8'))
+            if (cj && cj.ok) {
+              coreRev = Number(cj.rev) || 0
+              coreExpect = Number(cj.expect) || 0
+              corePrompts = (Array.isArray(cj.rules) ? cj.rules : []).map(function (x) { return String(x.prompt || '') }).filter(Boolean)
+              coreGot = corePrompts.length
+              coreCount = coreGot
+            } else { coreErr = String((cj && cj.error) || 'helper-not-ok') }
+          } else { coreErr = 'helper-fail' }
+        }
+      } catch (e) { coreErr = String((e && e.message) || e) }
+
       // ---- C4 混合检索：加载向量缓存 + 给当前话题算一个向量（同步 curl，失败即退化）----
       let vecMap = null
       const vecState = { ok: false, why: '', count: 0, dim: 0 }
@@ -363,6 +408,7 @@ export function apply(ctx, config) {
       //   最旧的那几条结论，而不是"活动段"或"怎么取细节"的提示。
       const lines = []
       lines.push('## ' + heading)
+      lines.push('> 规则库：rules@rev=' + coreRev + ' count=' + coreCount + ' ｜ 记忆：memories=' + mems.length + (coreErr ? ' CORE-ERROR' : (coreCount === 0 ? ' CORE-EMPTY' : '')) + (mems.length === 0 ? ' MEM-EMPTY' : ''))
       lines.push('')
       lines.push('')
       lines.push('> **强制指令（每次会话第一眼看这条）**：回答任何"以前怎么定的 / 约定 / 规则"类问题之前，必须先查记忆库，不许凭印象。')
@@ -374,7 +420,7 @@ export function apply(ctx, config) {
           ' ｜ 管理员组(SID 544) ' + (SELF_ID.admin === null ? '未知' : (SELF_ID.admin ? '是' : '否')))
       }
       // 2026-10-24 B1/B2：分区渲染（每段独立预算 + 全局去重 + 显式省略清单）
-      const SECTIONS = { recall: [], conv: [], shards: [], state: [], anchor: [], activity: [], hints: [], pinned: [], recent: [] }
+      const SECTIONS = { rules: [], recall: [], conv: [], shards: [], state: [], anchor: [], activity: [], hints: [], pinned: [], recent: [] }
       const SEC_BUDGET = { conv: 8000, shards: 2600, state: 2400, anchor: 900, recall: 1600, pinned: 1200, recent: 2000, activity: 700, hints: 400 }
       // 2026-10-24 修（17/18 复核 R3-⑤ 证实）：各段预算之和 16500 > maxChars 16000，
       //   尾部（hints=怎么查记忆）被全局截断吃掉，日志却还写着 hints=281（"有数字没送达"的假绿）。
@@ -501,7 +547,9 @@ export function apply(ctx, config) {
         const convSha16 = createHash('sha256').update(convBuf).digest('hex').slice(0, 16).toUpperCase()
         const convSize = convBuf.length
         let conv = convBuf.toString('utf8')
+        let convTruncated = false
       if (conv.length > conventionsMax) {
+        convTruncated = true
         const head = conv.slice(0, conventionsMax)
         const rest = conv.slice(conventionsMax)
         const dropped = (rest.match(/^##\s.+$/gm) || []).map(function (s) { return s.trim() })
@@ -539,8 +587,8 @@ export function apply(ctx, config) {
             SECTIONS.conv.push(conv)
             // 版本尾巴：不回写文件，只在注入末尾追加一行；机器可 grep：conventions@
             // 2026-10-24 r6（18 指出）：注入内容必须幂等 —— 尾巴不带时间戳，时间只进 inject.log
-            SECTIONS.conv.push('<!-- conventions@' + convSha16 + ' size=' + convSize + 'B injector=0.5.0-' + SELF_BUILD + ' -->')
-            log('INJECT-TAIL conventions@' + convSha16 + ' size=' + convSize + 'B at=' + new Date().toISOString())
+            SECTIONS.conv.push('<!-- conventions@' + convSha16 + ' size=' + convSize + 'B chars=' + conv.length + '/' + conventionsMax + (convTruncated ? ' TRUNCATED' : '') + ' injector=0.5.0-' + SELF_BUILD + ' -->')
+            log('INJECT-TAIL conventions@' + convSha16 + ' size=' + convSize + 'B chars=' + conv.length + '/' + conventionsMax + (convTruncated ? ' TRUNCATED' : '') + ' injector=0.5.0-' + SELF_BUILD + ' at=' + new Date().toISOString())
           }
           // ---- 关键约定分片：只注入命中当前话题关键词的分片，其余仅列名字（2026-10-24）----
           try {
@@ -657,6 +705,11 @@ export function apply(ctx, config) {
           }
         }
       } catch (e) { }
+      if (corePrompts.length) {
+        SECTIONS.rules.push('')
+        SECTIONS.rules.push('### 规则库·核心（rules@rev=' + coreRev + ' count=' + coreCount + '；必须先读并照此运行）')
+        for (const p of corePrompts) SECTIONS.rules.push('- ' + p)
+      }
       SECTIONS.pinned.push('')
       SECTIONS.pinned.push('### 定义型记忆（决策/事实/规则/更正，不按新旧筛）')
       try {
@@ -721,8 +774,8 @@ export function apply(ctx, config) {
         return out
       }
       const tail = []
-      for (const name of ['recall', 'conv', 'shards', 'state', 'anchor', 'pinned', 'recent', 'activity', 'hints']) {
-        const arr = assemble(name, SECTIONS[name], name === 'conv')
+      for (const name of ['rules', 'recall', 'conv', 'shards', 'state', 'anchor', 'pinned', 'recent', 'activity', 'hints']) {
+        const arr = assemble(name, SECTIONS[name], name === 'conv' || name === 'rules')
         if (arr.length) { tail.push(''); tail.push.apply(tail, arr) }
       }
       const head = lines.join('\n')
@@ -735,7 +788,7 @@ export function apply(ctx, config) {
           while (text.length > maxChars && SECTIONS[secName] && SECTIONS[secName].length > 2) {
             SECTIONS[secName].pop(); dropped++
             const rebuild = []
-            for (const nm of ['recall', 'conv', 'shards', 'state', 'anchor', 'pinned', 'recent', 'activity', 'hints']) {
+            for (const nm of ['rules', 'recall', 'conv', 'shards', 'state', 'anchor', 'pinned', 'recent', 'activity', 'hints']) {
               const arr = assemble(nm, SECTIONS[nm], nm === 'conv')
               if (arr.length) { rebuild.push(''); rebuild.push.apply(rebuild, arr) }
             }
@@ -759,6 +812,11 @@ export function apply(ctx, config) {
       budgetLog.eff = (EFF_BUDGET.hints || 0) + '/' + (EFF_BUDGET.recent || 0) + '/' + (EFF_BUDGET.activity || 0)
       log('INJECT-BUDGET ' + JSON.stringify(budgetLog))
       digest = text
+      try {
+        const rulesPartial = coreExpect !== coreGot
+        log('INJECT-RULES ' + JSON.stringify({ rev: coreRev, expect: coreExpect, got: coreGot, count: coreCount, partial: rulesPartial, memories: mems.length, core_empty: coreCount === 0, mem_empty: mems.length === 0, ms: coreMs, error: coreErr || undefined }))
+        if (rulesPartial) log('RULES-PARTIAL expect=' + coreExpect + ' got=' + coreGot)
+      } catch (e) {}
     } catch (e) {
       // 2026-10-24: 解析/读取失败必须“可见”，不能把整段记忆静默清空
       const msg = String((e && e.message) || e)
@@ -889,8 +947,18 @@ export function apply(ctx, config) {
   if (config.spoolCapture !== false) {
     try {
       const spoolPath = String(config.spoolPath || 'C:\\dsh-mem\\spool\\hot.jsonl')
-      const spoolMaxBytes = Number(config.spoolMaxBytes || 33554432)
-      const spoolTextMax = Number(config.spoolTextMax || 100000)
+      // T8: Number.isFinite fallback (NaN guard); Number(x || d) does not catch NaN
+      const spoolMaxRaw = config.spoolMaxBytes
+      const spoolMaxVal = Number(spoolMaxRaw)
+      const spoolMaxOk = Number.isFinite(spoolMaxVal) && spoolMaxVal > 0
+      const spoolMaxBytes = spoolMaxOk ? spoolMaxVal : 1073741824
+      const spoolMaxSource = (spoolMaxRaw == null) ? 'default' : (spoolMaxOk ? 'config' : 'default(invalid)')
+      if (spoolMaxSource === 'default(invalid)') log('spoolMaxBytes invalid; raw=' + JSON.stringify(spoolMaxRaw))
+      const spoolTextRaw = config.spoolTextMax
+      const spoolTextVal = Number(spoolTextRaw)
+      const spoolTextOk = Number.isFinite(spoolTextVal) && spoolTextVal > 0
+      const spoolTextMax = spoolTextOk ? spoolTextVal : 100000
+      if (spoolTextRaw != null && !spoolTextOk) log('spoolTextMax invalid; raw=' + JSON.stringify(spoolTextRaw))
       try { mkdirSync(dirname(spoolPath), { recursive: true }) } catch (e) { /* already exists */ }
 
       // 2026-10-25 (2nd pass): 第一版只用 firstText(event.data)，实测只捕获到 user/message
@@ -959,7 +1027,7 @@ export function apply(ctx, config) {
           log('spool handler failed: ' + (err && err.message))
         }
       })
-      log('spool capture armed path=' + spoolPath + ' textMax=' + spoolTextMax + ' rotateAt=' + spoolMaxBytes)
+      log('spool capture armed path=' + spoolPath + ' textMax=' + spoolTextMax + ' rotateAt=' + spoolMaxBytes + ' source=' + spoolMaxSource)
     } catch (err) {
       log('failed to arm spool capture: ' + (err && err.message))
     }

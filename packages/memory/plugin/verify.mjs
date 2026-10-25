@@ -22,6 +22,7 @@
 //      —— 这条能直接抓住时区偏移（正是我踩的那个坑）
 
 import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -89,9 +90,47 @@ if (!contextEntry) { console.error('FAIL: 没有注册 prompt context'); process
 const text = contextEntry.text()
 console.log('context     = name=' + contextEntry.name + ' order=' + contextEntry.order)
 console.log('digest      = ' + text.length + ' chars, 同步且稳定=' + (text === contextEntry.text()))
+
 console.log('--- 注入内容前 6 行 ---')
 for (const l of text.split('\n').slice(0, 6)) console.log('  ' + l)
 if (text.length === 0) { console.error('FAIL: 注入内容为空'); process.exit(2) }
+// ---------------- T5/T4/T7: spool 配置 + 尾部字段断言（2026-10-25） ----------------
+// 判据跟着被测物走：旧 verifier 只看注入内容，会把"改了配置没生效"报成绿。
+// ① INJECT-TAIL 必须含 chars=<n>/<max> 与 injector=0.5.0-<sha16>（T7）
+// ② spool armed 行必须含 rotateAt=<期望> 与 source=config|default（T4）
+// ③ 阳性对照：VERIFY_SPOOL_MAX=33554432 时 rotateAt=33554432 ≠ 期望 ⇒ 必须红
+{
+  let tailLog = ''
+  try { tailLog = readFileSync(probeLog, 'utf8') } catch (e) { }
+  const tail = (tailLog.match(/INJECT-TAIL[^\n]*/g) || []).pop() || ''
+  if (!/chars=\d+\/\d+/.test(tail)) { console.error('FAIL(11): INJECT-TAIL 缺 chars=<n>/<max>：' + tail); process.exit(11) }
+  if (!/injector=0\.5\.0-[0-9A-Fa-f]{8}/.test(tail)) { console.error('FAIL(12): INJECT-TAIL 缺 injector=0.5.0-<sha16>：' + tail); process.exit(12) }
+  console.log('tail assert = OK (chars + injector)')
+
+  const expectRotate = Number(process.env.VERIFY_EXPECT_ROTATE || 1073741824)
+  const spoolLog = join(tmpdir(), 'dsh-memory-bridge-verify-spool.log')
+  const spoolPath = join(tmpdir(), 'dsh-memory-bridge-verify-spool.jsonl')
+  try { rmSync(spoolLog, { force: true }) } catch (e) { }
+  try { rmSync(spoolPath, { force: true }) } catch (e) { }
+  const extra = process.env.VERIFY_SPOOL_MAX ? { spoolMaxBytes: Number(process.env.VERIFY_SPOOL_MAX) } : {}
+  const d2 = mod.apply(fakeCtx, Object.assign({ replicaPath, cliPath: stubCli, spoolCapture: true, spoolPath, logPath: spoolLog, localProviders: ['ollama-local'] }, extra))
+  await new Promise((r) => setTimeout(r, 120))
+  try { d2() } catch (e) { }
+  let armedLog = ''
+  try { armedLog = readFileSync(spoolLog, 'utf8') } catch (e) { }
+  const armed = (armedLog.match(/spool capture armed[^\n]*/g) || []).pop() || ''
+  const m = /rotateAt=(\d+)(?:\s+source=(config|default(?:\(invalid\))?))?/.exec(armed)
+  if (!m) { console.error('FAIL(10): 没有 spool capture armed 行：' + armed); process.exit(10) }
+  const actual = Number(m[1])
+  const source = m[2] || '?'
+  console.log('armed assert= ' + armed)
+  if (!m[2]) { console.error('FAIL(10): armed 行缺 source=config|default'); process.exit(10) }
+  if (actual !== expectRotate) {
+    console.error('FAIL(10): rotateAt=' + actual + ' 期望 ' + expectRotate + '（阳性对照：VERIFY_SPOOL_MAX=33554432 时必须红）')
+    process.exit(10)
+  }
+  console.log('spool assert= OK rotateAt=' + actual + ' source=' + source)
+}
 
 // ---------------- v0.3.0: 活动段断言 ----------------
 let activityOK = false
@@ -167,6 +206,62 @@ if (actIdx < 0) {
   activityOK = true
 }
 
+// ---------------- T17-B: core 规则注入断言（规则库第一优先） ----------------
+{
+  function coreRules(tier) {
+    const out = join(tmpdir(), 'verify-core-' + tier + '-' + process.pid + '.json')
+    try { rmSync(out, { force: true }) } catch (e) { }
+    const r = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+      'C:\\dsh-mem\\ops\\mem-core-rules.ps1', '-Tier', tier, '-OutFile', out], { encoding: 'utf8', timeout: 15000 })
+    if (!r || r.status !== 0 || !existsSync(out)) return null
+    try { return JSON.parse(readFileSync(out, 'utf8')) } catch (e) { return null }
+  }
+  const hdr = /rules@rev=(\d+) count=(\d+)/.exec(text)
+  const mem = /memories=(\d+)/.exec(text)
+  if (!hdr) { console.error('FAIL(13): 注入头缺 rules@rev=/count='); process.exit(13) }
+  if (!mem) { console.error('FAIL(13): 注入头缺 memories='); process.exit(13) }
+  const core = coreRules('core')
+  if (!core || !core.ok) { console.error('FAIL(13): core 规则助手不可用'); process.exit(13) }
+  if (Number(hdr[1]) !== Number(core.rev)) { console.error('FAIL(13): rules@rev=' + hdr[1] + ' != 库 max(version)=' + core.rev); process.exit(13) }
+  if (Number(hdr[2]) !== Number(core.count)) { console.error('FAIL(13): count=' + hdr[2] + ' != core 行数=' + core.count); process.exit(13) }
+  for (const r of core.rules) {
+    if (text.indexOf(r.prompt) < 0) { console.error('FAIL(14): core 规则未注入: ' + r.name); process.exit(14) }
+  }
+  console.log('rules assert= OK rules@rev=' + core.rev + ' count=' + core.count + ' memories=' + mem[1])
+  const det = coreRules('detail')
+  if (det && det.ok) {
+    for (const r of det.rules) {
+      if (text.indexOf(r.prompt) >= 0) { console.error('FAIL(15): detail 规则泄漏进 core 注入: ' + r.name); process.exit(15) }
+    }
+    console.log('detail assert= OK leaked=0 (checked ' + det.count + ' detail rows)')
+  }
+  // CORE-EMPTY 阳性对照：coreRules=false 时必须出现 CORE-EMPTY 且不注入 core 规则
+  const dEmpty = mod.apply(fakeCtx, { replicaPath, cliPath: stubCli, spoolCapture: false, logPath: probeLog,
+    localProviders: ['ollama-local'], callLogFlushMs: 150, coreRules: false })
+  let tEmpty = ''
+  try { tEmpty = contextEntry.text() } catch (e) { }
+  try { dEmpty() } catch (e) { }
+  if (!/CORE-EMPTY/.test(tEmpty)) { console.error('FAIL(16): coreRules=false 时注入头未出现 CORE-EMPTY'); process.exit(16) }
+  for (const r of core.rules) {
+    if (tEmpty.indexOf(r.prompt) >= 0) { console.error('FAIL(16): CORE-EMPTY 场景仍注入了 core 规则'); process.exit(16) }
+  }
+  console.log('core-empty assert= OK (阳性对照)')
+
+  // T18: 连续 20 轮 expect==got（expect 由 helper 直接查库，got 由注入器实读条数）
+  let okRounds = 0
+  for (let i = 0; i < 20; i++) {
+    const dLoop = mod.apply(fakeCtx, { replicaPath, cliPath: stubCli, spoolCapture: false, logPath: probeLog,
+      localProviders: ['ollama-local'], callLogFlushMs: 150, semantic: false })
+    let tLoop = ''
+    try { tLoop = contextEntry.text() } catch (e) { }
+    try { dLoop() } catch (e) { }
+    const c2 = coreRules('core')
+    const h2 = /count=(\d+)/.exec(tLoop)
+    if (c2 && c2.ok && h2 && Number(h2[1]) === Number(c2.expect) && Number(h2[1]) === Number(c2.got)) okRounds++
+  }
+  if (okRounds !== 20) { console.error('FAIL(17): 连续 20 轮 expect==got 失败: ' + okRounds + '/20'); process.exit(17) }
+  console.log('rules 20-round = 20/20 expect==got (expect=' + core.expect + ')')
+}
 if (typeof eventHandler !== 'function') {
   console.log('eventHandler= 未挂上（v0.5.4+ 自动捕获改走 spool：C:\\dsh-mem\\spool\\hot.jsonl，这是新架构下的正常结果；要判实时性请测 hot.jsonl 是否增长）')
   console.log('RESULT: PASS (注入部分)')

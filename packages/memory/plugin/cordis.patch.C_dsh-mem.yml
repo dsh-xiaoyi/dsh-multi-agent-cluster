@@ -16,5 +16,6 @@
         cliPath: 'C:\dsh-mem\dsh-mem.ps1'
         limit: 8
         maxChars: 16000          # 2026-10-24: 2400 太小，会把活动段/定义型记忆整段截掉
-        conventionsMax: 8000      # 关键约定单独限长，超出时标注'已截断'
+        conventionsMax: 3000      # 关键约定单独限长，超出时标注'已截断'
         refreshMs: 60000
+        spoolMaxBytes: 1073741824
