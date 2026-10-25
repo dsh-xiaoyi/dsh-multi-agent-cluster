@@ -1,5 +1,4 @@
-﻿# 第一次用？先看 README 的「5 分钟跑起来」，再回来读这个脚本。
-<#
+﻿<#
   dsh-mem.ps1  -  DSH long-term memory CLI
   Requires PowerShell 7 or Windows PowerShell 5.1 (System.Data.SqlClient + SqlBulkCopy).
 
@@ -35,7 +34,7 @@
     answers.  Anything else => a DEGRADED line is printed and literal search plus
     surrounding turns is used instead.  Silent degradation is forbidden on purpose
     (see shared memory [115]).
-      "embed": { "baseURL": "http://192.0.2.18:11434", "model": "bge-m3", "dim": 1024 }
+      "embed": { "baseURL": "http://10.0.0.18:11434", "model": "bge-m3", "dim": 1024 }
     Use the model host's own IP: 127.0.0.1 would only work on that host itself.
 
   Offline behaviour
@@ -65,6 +64,7 @@ param(
   [int]$Chars = 0,
   [switch]$Reembed,
   [switch]$DryRun,
+  [switch]$AllowMessagePrune,
   [switch]$SelfTest,
   [string]$Tags = '',
   [string]$Scope = 'machine',
@@ -107,10 +107,10 @@ $CfgPath = Join-Path $Root 'dsh-mem.config.json'
 if (-not (Test-Path -LiteralPath $CfgPath)) { throw "config not found: $CfgPath" }
 $cfg = Read-TextFile $CfgPath | ConvertFrom-Json
 
-# --- explicit version, so the cluster never has to infer it from a byte count again ------------
+# --- explicit version, so the fleet never has to infer it from a byte count again ------------
 # Lineage: 32174 (prune/handoff) -> 53025 (offline replica) -> 74605 (recall + embed half)
 #          -> 77609 (path b: vectors keyed by content hash) -> 80330 (3 defects fixed)
-#          -> 81395 (duplicate consolidation, cluster audit) -> 1.0.0 (UNIFIED baseline:
+#          -> 81395 (duplicate consolidation, fleet audit) -> 1.0.0 (UNIFIED baseline:
 #             export redaction on handoff/backup/replica + this version report + check 14).
 # Memory [177]/[178] is what happens without this string: two machines compared byte counts,
 # both read a stale number, and the direction of the fix was reported backwards.
@@ -382,7 +382,7 @@ function Invoke-Sync {
       'tool/call' {
         if ($IncludeTools) {
           $arg = [string]$e.data.arguments
-          if ($arg.Length -gt 8000) { $arg = $arg.Substring(0, 8000) + '...[truncated at 8000 chars]' }
+          if ($arg.Length -gt 32000) { $arg = $arg.Substring(0, 32000) + '...[truncated at 32000 chars]' }
           $t = ('[' + $e.data.name + '] ' + $arg)
           $r = $dt.NewRow(); $r.session_id = $sid; $r.seq = [int64]$e.seq; $r.turn = [int]$e.data.turn; $r.role = 'tool_call'; $r.text = $t; $r.created_at = $ts; [void]$dt.Rows.Add($r); $nTool++
         }
@@ -458,7 +458,8 @@ function Invoke-Sync {
     $cmdW.CommandText = @"
 DECLARE @dropped int, @changed int, @ins int, @upd int, @del int;
 SELECT @dropped = COUNT(*) FROM dbo.messages m LEFT JOIN #incoming i ON i.seq = m.seq
-  WHERE m.session_id = @sid AND i.seq IS NULL;
+  WHERE m.session_id = @sid AND i.seq IS NULL
+    AND NOT (ISNULL(m.source, '') = 'spool' AND m.created_at > DATEADD(minute, -10, SYSUTCDATETIME()));
 SELECT @changed = COUNT(*) FROM dbo.messages m JOIN #incoming i ON i.seq = m.seq
   WHERE m.session_id = @sid AND (CONVERT(varchar(32), HASHBYTES('MD5', m.text), 2) <> CONVERT(varchar(32), HASHBYTES('MD5', i.text), 2)
         OR ISNULL(m.role, '') <> ISNULL(i.role, '') OR ISNULL(m.turn, -1) <> ISNULL(i.turn, -1));
@@ -468,7 +469,9 @@ SELECT m.id, m.session_id, m.seq, m.turn, m.role, m.text, m.created_at,
 FROM dbo.messages m LEFT JOIN #incoming i ON i.seq = m.seq
 WHERE m.session_id = @sid
   AND (i.seq IS NULL OR CONVERT(varchar(32), HASHBYTES('MD5', m.text), 2) <> CONVERT(varchar(32), HASHBYTES('MD5', i.text), 2)
-       OR ISNULL(m.role, '') <> ISNULL(i.role, '') OR ISNULL(m.turn, -1) <> ISNULL(i.turn, -1));
+       OR ISNULL(m.role, '') <> ISNULL(i.role, '') OR ISNULL(m.turn, -1) <> ISNULL(i.turn, -1))
+  -- 2026-10-25 实时 spool 通道：刚由 spool 写入、但会话文件还没落盘到那一帧的行，不判 dropped
+  AND NOT (i.seq IS NULL AND ISNULL(m.source, '') = 'spool' AND m.created_at > DATEADD(minute, -10, SYSUTCDATETIME()));
 UPDATE m SET m.turn = i.turn, m.role = i.role, m.text = i.text, m.created_at = i.created_at
 FROM dbo.messages m JOIN #incoming i ON i.seq = m.seq
 WHERE m.session_id = @sid
@@ -480,7 +483,9 @@ SELECT @sid, i.seq, i.turn, i.role, i.text, i.created_at FROM #incoming i
 WHERE NOT EXISTS (SELECT 1 FROM dbo.messages m WHERE m.session_id = @sid AND m.seq = i.seq);
 SET @ins = @@ROWCOUNT;
 DELETE m FROM dbo.messages m
-WHERE m.session_id = @sid AND NOT EXISTS (SELECT 1 FROM #incoming i WHERE i.seq = m.seq);
+WHERE m.session_id = @sid AND NOT EXISTS (SELECT 1 FROM #incoming i WHERE i.seq = m.seq)
+  -- 2026-10-25 实时 spool 通道：最近 10 分钟由 spool 写入的行先留着（等会话文件落盘后自然对齐）
+  AND NOT (ISNULL(m.source, '') = 'spool' AND m.created_at > DATEADD(minute, -10, SYSUTCDATETIME()));
 SET @del = @@ROWCOUNT;
 SELECT @dropped AS dropped, @changed AS changed, @ins AS inserted, @upd AS updated, @del AS removed;
 "@
@@ -598,7 +603,7 @@ function Get-MemoriesById {
 
 function Get-EmbedSettings {
   # F-plan hook.  Nothing below is active until dsh-mem.config.json gains:
-  #   "embed": { "baseURL": "http://192.0.2.18:11434", "model": "bge-m3", "dim": 1024 }
+  #   "embed": { "baseURL": "http://10.0.0.18:11434", "model": "bge-m3", "dim": 1024 }
   # baseURL must be the model host's IP -- 127.0.0.1 would only work on that host.
   if (-not $cfg.embed) { return $null }
   $b = [string]$cfg.embed.baseURL
@@ -1015,14 +1020,35 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf)
     if ($gotB -ne $inBodyLen -or $gotT -ne $inTitleLen) {
       Write-Host ("  WARN stored length differs from input (redaction or truncation?) -- verify with: dsh-mem.ps1 recent")
     }
+    # 2026-10-24 C2：写入即留痕（append-only 审计表；失败不影响主流程）
+    try {
+      $h = [System.Security.Cryptography.SHA256]::Create()
+      $hb = $h.ComputeHash([System.Text.Encoding]::UTF8.GetBytes([string]$Body))
+      $afterHash = -join ($hb | ForEach-Object { $_.ToString('x2') })
+      $actor = [System.Environment]::MachineName
+      $null = Invoke-Rows -Sql "INSERT INTO dbo.memory_events (memory_id, action, actor_machine, actor_session, after_hash, reason) VALUES (@mid, 'add', @m, @s, @h, @r)" -Params @{ '@mid' = $newId; '@m' = $actor; '@s' = [string]$Target; '@h' = $afterHash; '@r' = ('kind=' + $Kind) }
+    } catch { Write-Host ("  NOTE memory_events 写入失败（不影响已保存的记忆）: " + $_.Exception.Message.Split("`n")[0]) }
   }
 
   'search' {
     if (-not $Target) { throw "search requires a keyword" }
-    $q = '%' + $Target + '%'
+    # 2026-10-24 B4：① LIKE 通配符转义（原来 `search 备份_` 里 _ 当任意字符，440 条假命中）
+    #              ② 多词按 AND 拆开（原来 `"共享盘 SMB"` 整串一个 LIKE，零命中）
+    #              ③ 排序：checkpoint 垫底 → 标题命中优先 → 更新时间
+    $terms = @($Target -split '\s+' | Where-Object { $_ })
+    if ($terms.Count -eq 0) { $terms = @($Target) }
+    $likeParams = @{ '@n' = $Limit }
+    $likeClauses = @()
+    for ($ti = 0; $ti -lt $terms.Count; $ti++) {
+      $esc = $terms[$ti] -replace '\[', '[[]' -replace '%', '[%]' -replace '_', '[_]'
+      $likeParams['@q' + $ti] = '%' + $esc + '%'
+      $likeClauses += ('(title LIKE @q' + $ti + ' OR body LIKE @q' + $ti + ' OR tags LIKE @q' + $ti + ')')
+    }
+    $whereLike = ($likeClauses -join ' AND ')
     if (Test-DbAlive) {
       Write-Host ("== memories matching '$Target' ==")
-      $m = Invoke-Rows -Sql "SELECT TOP (@n) id, created_at, scope, subject, kind, title, tags, body FROM dbo.memories WHERE title LIKE @q OR body LIKE @q OR tags LIKE @q ORDER BY updated_at DESC" -Params @{ '@n' = $Limit; '@q' = $q }
+      $sqlMem = "SELECT TOP (@n) id, created_at, scope, subject, kind, title, tags, body FROM dbo.memories WHERE $whereLike ORDER BY CASE WHEN kind = 'checkpoint' THEN 1 ELSE 0 END, CASE WHEN title LIKE @q0 THEN 0 ELSE 1 END, updated_at DESC"
+      $m = Invoke-Rows -Sql $sqlMem -Params $likeParams
       if (@($m).Count -eq 0) { Write-Host "  (none)" }
       foreach ($r in @($m)) {
         Write-Host ("  [{0}] {1} {2}/{3} {4}  {5}" -f $r.id, $r.created_at.ToLocalTime().ToString('MM-dd HH:mm'), $r.scope, $r.subject, $r.kind, $r.title)
@@ -1043,16 +1069,22 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf)
       }
       Write-Host ""
       Write-Host ("== messages matching '$Target' ==")
-      $g = Invoke-Rows -Sql "SELECT TOP (@n) session_id, seq, role, created_at, LEFT(text, 200) AS snippet FROM dbo.messages WHERE text LIKE @q ORDER BY created_at DESC" -Params @{ '@n' = $Limit; '@q' = $q }
+      $msgWhere = (@($terms | ForEach-Object -Begin { $i = 0 } -Process { $i++; '(text LIKE @q' + ($i - 1) + ')' }) -join ' AND ')
+      $g = Invoke-Rows -Sql "SELECT TOP (@n) session_id, seq, role, created_at, LEFT(text, 200) AS snippet FROM dbo.messages WHERE $msgWhere ORDER BY created_at DESC" -Params $likeParams
       if (@($g).Count -eq 0) { Write-Host "  (none)" }
       foreach ($r in @($g)) { Write-Host ("  {0} #{1} {2}: {3}" -f $r.created_at.ToLocalTime().ToString('MM-dd HH:mm'), $r.seq, $r.role, ($r.snippet -replace '\s+', ' ')) }
     } else {
       $rep = Get-Replica
       if (-not $rep) { Write-NoReplica; return }
       Write-Host ("  OFFLINE - local replica, last synced " + $rep.generatedAt)
-      $k = $Target.ToLower()
+      $kws = @($terms | ForEach-Object { $_.ToLower() })
       Write-Host ("== memories matching '$Target' ==")
-      $mm = @($rep.memories) | Where-Object { (([string]$_.title) + ' ' + ([string]$_.body) + ' ' + ([string]$_.tags)).ToLower().Contains($k) } | Select-Object -First $Limit
+      $mm = @($rep.memories) | Where-Object {
+        $hay = (([string]$_.title) + ' ' + ([string]$_.body) + ' ' + ([string]$_.tags)).ToLower()
+        $ok = $true
+        foreach ($kw in $kws) { if (-not $hay.Contains($kw)) { $ok = $false; break } }
+        $ok
+      } | Sort-Object { if ([string]$_.kind -eq 'checkpoint') { 1 } else { 0 } }, @{Expression = { [datetime]$_.updated_at }; Descending = $true} | Select-Object -First $Limit
       if (@($mm).Count -eq 0) { Write-Host "  (none)" }
       foreach ($r in @($mm)) {
         Write-Host ("  [{0}] {1} {2}/{3}  {4}" -f $r.id, ([datetime]$r.updated_at).ToLocalTime().ToString('MM-dd HH:mm'), $r.scope, $r.subject, $r.title)
@@ -1259,7 +1291,7 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf)
     $mdl = ''
     if ($Model) { $mdl = $Model } elseif ($e) { $mdl = $e.model }
     if (-not $base -or -not $mdl) {
-      throw "embed needs a baseURL and a model. Add to dsh-mem.config.json: `"embed`": { `"baseURL`": `"http://192.0.2.18:11434`", `"model`": `"bge-m3`", `"dim`": 1024 }  (or pass -BaseURL / -Model)"
+      throw "embed needs a baseURL and a model. Add to dsh-mem.config.json: `"embed`": { `"baseURL`": `"http://10.0.0.18:11434`", `"model`": `"bge-m3`", `"dim`": 1024 }  (or pass -BaseURL / -Model)"
     }
     $nChars = $Chars
     if ($nChars -le 0 -and $cfg.embed -and $cfg.embed.chars) { $nChars = [int]$cfg.embed.chars }
@@ -1387,7 +1419,7 @@ WHERE e.model = @model AND e.item_type = 'message'
       # Consolidate to ONE vector per (model, item_type, text_hash): prefer a row whose target
       # is live, else the newest.  The earlier version dropped only ORPHAN duplicates, so
       # 17 groups of legacy "live row + live row, same content" survived -- found by the
-      # cluster audit 2026-10-06 (44 vectors / 27 redundant), which also produced duplicate
+      # fleet audit 2026-10-06 (44 vectors / 27 redundant), which also produced duplicate
       # ranking lines.  Content is what `recall` resolves on, so one vector per hash is enough.
       $deduped = Invoke-Exec -Sql @"
 ;WITH r AS (
@@ -1569,7 +1601,7 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
   }
 
   'roster' {
-    # cli_version turns this from a presence list into a cluster VERSION check: three machines
+    # cli_version turns this from a presence list into a fleet VERSION check: three machines
     # reporting the same string is the thing [177]/[178] tried to establish from byte counts.
     $m = Invoke-Rows -Sql "SELECT login_name, machine, purpose, first_seen, last_seen, cli_version FROM dbo.machines ORDER BY login_name"
     Write-Host ("== 记忆库成员 " + @($m).Count + " 个 ==")
@@ -1584,16 +1616,16 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
     # all machines that report a version must agree, otherwise say so loudly
     $uniq = @($seen | Select-Object -Unique)
     if ($uniq.Count -gt 1) {
-      Write-Host ("  WARN: cluster versions differ -> " + ($uniq -join ', ') + "   (this machine: " + $script:CliVersion + ")")
+      Write-Host ("  WARN: fleet versions differ -> " + ($uniq -join ', ') + "   (this machine: " + $script:CliVersion + ")")
     } elseif ($uniq.Count -eq 1) {
-      Write-Host ("  cluster cli version: " + $uniq[0] + $(if ($uniq[0] -eq $script:CliVersion) { "  (this machine agrees)" } else { "  WARN: this machine is " + $script:CliVersion }))
+      Write-Host ("  fleet cli version: " + $uniq[0] + $(if ($uniq[0] -eq $script:CliVersion) { "  (this machine agrees)" } else { "  WARN: this machine is " + $script:CliVersion }))
     }
   }
 
   'version' {
-    # One string that identifies the whole script, so the cluster stops guessing from byte counts.
+    # One string that identifies the whole script, so the fleet stops guessing from byte counts.
     # It is also reported into dbo.machines on every run that touches the DB (Register-Host),
-    # which is what makes 'roster' a cluster-wide version check (memory [177]/[178] is why).
+    # which is what makes 'roster' a fleet-wide version check (memory [177]/[178] is why).
     $vFile = $PSCommandPath
     if (-not $vFile) { $vFile = Join-Path $Root 'dsh-mem.ps1' }
     $vLen = (Get-Item -LiteralPath $vFile).Length
@@ -1603,7 +1635,7 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
     Write-Host ("  size    : " + $vLen + " bytes   sha256[0..15] " + $vSha)
     Write-Host ("  limits  : " + (($script:ColLimits.Keys | ForEach-Object { $_ + " " + $script:ColLimits[$_] }) -join ' / ') + "  (mirror dbo.memories; guard check 15 enforces the boundary)")
     Write-Host ("  server  : " + $cfg.server + " / " + $script:Db)
-    Write-Host  "  cluster   : run 'roster' to see the version each machine reports in dbo.machines"
+    Write-Host  "  fleet   : run 'roster' to see the version each machine reports in dbo.machines"
   }
 
   'handoff' {
@@ -1698,6 +1730,11 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
     #   dry run : dsh-mem.ps1 prune             (default -- just reports)
     #   execute : dsh-mem.ps1 prune -Force
     $days = if ($Target) { [int]$Target } else { 90 }
+    if ($Force -and -not $AllowMessagePrune) {
+      Write-Host '  REFUSED: raw conversation messages are permanently retained (owner 2026-10-25).'
+      Write-Host '           pass -AllowMessagePrune only if you really intend to delete them.'
+      return
+    }
     $cut  = (Get-Date).ToUniversalTime().AddDays(-$days)
     $old = Invoke-Rows -Sql "SELECT COUNT(*) AS n FROM dbo.messages WHERE created_at < @cut" -Params @{ '@cut' = $cut }
     $orph = Invoke-Rows -Sql "SELECT COUNT(*) AS n FROM dbo.sessions s WHERE NOT EXISTS (SELECT 1 FROM dbo.messages m WHERE m.session_id = s.session_id)"
@@ -1745,7 +1782,10 @@ foreach ($r in @($mem)) {
     $repJson = $rep | ConvertTo-Json -Depth 6 -Compress
     $repHits = Get-SecretHitCount $repJson
     # write WITHOUT a BOM: PowerShell 5.1's -Encoding UTF8 adds one, and Node's JSON.parse rejects it
-    [System.IO.File]::WriteAllText($script:ReplicaPath, $repJson, (New-Object System.Text.UTF8Encoding $false))
+    # 2026-10-24 原子写：先写 .tmp 再改名，避免插件读到被截断的半个 JSON
+    $tmpReplica = $script:ReplicaPath + ".tmp"
+    [System.IO.File]::WriteAllText($tmpReplica, $repJson, (New-Object System.Text.UTF8Encoding $false))
+    Move-Item -LiteralPath $tmpReplica -Destination $script:ReplicaPath -Force
     $kb = [math]::Round((Get-Item -LiteralPath $script:ReplicaPath).Length / 1KB, 1)
     Write-Host ("  OK  replica -> " + $script:ReplicaPath)
     Write-Host ("      memories=" + @($mem).Count + "  messages=" + @($msg).Count + "  sessions=" + @($sess).Count + "  size=" + $kb + " KB")
@@ -1754,8 +1794,7 @@ foreach ($r in @($mem)) {
 
   'backup' {
     $stamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
-    # 备份目录：优先环境变量 DSH_BACKUP_DIR，其次 <配置目录>\backup（不再写死某台机器的盘符）
-    $bakDir = if ($env:DSH_BACKUP_DIR) { $env:DSH_BACKUP_DIR } else { Join-Path (Split-Path $ConfigPath -Parent) 'backup' }
+    $bakDir = 'E:\DSHDB\backup'
     $bak    = Join-Path $bakDir ("DSHMemory_" + $stamp + ".bak")
     try {
       [void](Invoke-Exec -Sql "BACKUP DATABASE [$script:Db] TO DISK = N'$bak' WITH INIT, COMPRESSION, CHECKSUM, STATS = 25" -Db 'master')

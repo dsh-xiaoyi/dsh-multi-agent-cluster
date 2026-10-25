@@ -124,3 +124,9 @@ BUDGET_FLOOR shards 700 ｜ state 1200 ｜ anchor 350 ｜ recall 500 ｜ pinned 
   `name + arguments`，最后还有"序列化兜底"（保证事件不静默消失）。
 - 单元测试：6 个事件覆盖 user / assistant（含嵌套）/ tool/call / tool/result（块 + 字符串）→ 6/6 全部落盘。
 - `verify.mjs` 的两处 apply 显式 `spoolCapture: false`，自测不再往真实 spool 写（此前会留 `session-00000000-*` 噪音行）。
+### 修复（发布前最后三项）
+- **sync 不再误杀刚写入的 spool 行**：`dsh-mem.ps1` 的对账归档原本会把"spool 已写入、但会话文件还没落盘到那一帧"的行判成 `dropped`。
+  现在归档与删除都对"10 分钟内、source='spool'"的行放行（等会话文件追上来自然对齐），计数也同步遵守该规则。
+- **verify 的旧架构提示语改掉**：v0.5.4 起自动捕获改走 spool，`eventHandler= 未挂上` 已属正常结果，
+  提示改为"要看实时性请测 hot.jsonl 是否增长"，避免每次验收冒一条像故障的行。
+- **入库权限补齐**：`dsh_mem_01` / `dsh_mem_18` 此前只有 `SELECT ON dbo.messages`，实时导入需要 `INSERT`（已最小授权）。
