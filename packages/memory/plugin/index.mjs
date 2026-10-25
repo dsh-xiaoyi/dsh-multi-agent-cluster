@@ -40,14 +40,14 @@
 //   * capture is switchable (autoCapture:false) and de-duplicated per event
 //   * the CLI applies the same secret redaction as manual saves
 
-import { readFileSync, existsSync, readdirSync, writeFileSync, mkdtempSync, rmSync, statSync } from 'node:fs'
+import { readFileSync, existsSync, readdirSync, writeFileSync, mkdtempSync, rmSync, statSync, appendFileSync, renameSync, mkdirSync } from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import os, { tmpdir } from 'node:os'   // 2026-10-25 修：之前只取了 tmpdir，os 未定义 ⇒ SELF_ID 抛错被 catch 吞
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export const VERSION = '0.5.2'
+export const VERSION = '0.5.3'
 export const name = 'dsh-memory-bridge'
 export const inject = ['systemPrompt']
 
@@ -876,6 +876,49 @@ export function apply(ctx, config) {
       log('auto-capture armed')
     } catch (err) {
       log('failed to arm auto-capture: ' + (err && err.message))
+    }
+  }
+
+  // ---------------- 2b) REAL-TIME SPOOL (2026-10-25, plan B) ----------------
+  // WHY: the file-based `dsh-mem.ps1 sync` costs ~30 s per run no matter how few turns are new
+  // (it decompresses the whole session file), so it cannot deliver "each turn lands within seconds".
+  // Here the plugin writes every message event to a local JSONL spool with ZERO child processes
+  // (appendFileSync only). `ops\spool-import.ps1` then imports only the new lines every ~8 s.
+  // Rules honoured: no DB write from the plugin (a hanging DB must never block a turn), the spool
+  // is the only side effect, and every 200th line is logged so "armed but silent" is detectable.
+  if (config.spoolCapture !== false) {
+    try {
+      const spoolPath = String(config.spoolPath || 'C:\\dsh-mem\\spool\\hot.jsonl')
+      const spoolMaxBytes = Number(config.spoolMaxBytes || 33554432)
+      const spoolTextMax = Number(config.spoolTextMax || 100000)
+      try { mkdirSync(dirname(spoolPath), { recursive: true }) } catch (e) { /* already exists */ }
+      let spoolCount = 0
+      ctx.on('session/event', function (session, event) {
+        try {
+          if (!event || typeof event.type !== 'string') return
+          const sid = String((session && session.id) || '?')
+          const seq = Number(event.seq || 0)
+          const text = firstText(event.data)
+          if (!text) return
+          const clipped = text.length > spoolTextMax ? text.slice(0, spoolTextMax) + '\n…[spool-trunc]' : text
+          const rec = { ts: new Date().toISOString(), session: sid, seq: seq, type: event.type, text: clipped }
+          let st = null
+          try { st = statSync(spoolPath) } catch (e) { st = null }
+          if (st && st.size > spoolMaxBytes) {
+            try { renameSync(spoolPath, spoolPath + '.1') } catch (e) { /* next append recreates */ }
+          }
+          appendFileSync(spoolPath, JSON.stringify(rec) + '\n', 'utf8')
+          spoolCount++
+          if (spoolCount === 1 || spoolCount % 200 === 0) {
+            log('SPOOL n=' + spoolCount + ' last=' + event.type + ' seq=' + seq + ' bytes=' + Buffer.byteLength(rec.text))
+          }
+        } catch (err) {
+          log('spool handler failed: ' + (err && err.message))
+        }
+      })
+      log('spool capture armed path=' + spoolPath + ' textMax=' + spoolTextMax + ' rotateAt=' + spoolMaxBytes)
+    } catch (err) {
+      log('failed to arm spool capture: ' + (err && err.message))
     }
   }
 

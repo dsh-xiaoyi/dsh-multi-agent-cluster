@@ -98,3 +98,21 @@ BUDGET_FLOOR shards 700 ｜ state 1200 ｜ anchor 350 ｜ recall 500 ｜ pinned 
 ### 维护脚本安全（A3）
 
 - `mem-maintenance.ps1` 新增 `-AllowDelete`；没有它时 `-Apply` 自动降级为 DRY-RUN（只报告，不删）。
+
+## [0.5.3] — 2026-10-25（实时同步）
+
+### 新增：spool 实时捕获（每轮即时入库）
+- 插件在 `session/event` 里把**每一条**消息事件追加到 `C:\dsh-mem\spool\hot.jsonl`
+  （只写文件：不 spawn 子进程、不直连数据库 —— DB 抖动不会阻塞任何一轮对话）
+- 轮转：超过 `spoolMaxBytes`（默认 32MB）改名为 `hot.jsonl.1`；单条文本上限 `spoolTextMax`（默认 100000 字符）
+- 关闭开关：`spoolCapture: false`
+- 为何不给 `dsh-mem.ps1 sync` 提频：实测单次 sync 约 30 秒且成本随会话体积增长，
+  1 分钟间隔会重叠、延迟反而从 2 分钟涨到 4 分钟（已回滚到 3 分钟）
+
+### 新增：增量导入器（配套脚本）
+- `ops/spool-import.ps1`：按偏移量只读新增行，`(session_id, seq)` 去重，单实例锁，失败写日志
+- `ops/spool-import-loop.ps1`：常驻循环每 8 秒导入一次；实测 spool 行 → 入库 = 9.3 秒
+
+### 修复：自测更严格
+- `verify.mjs` 的 mock ctx 由"只记一个 handler"改为"收集全部 handler 并逐个派发"
+  （新增第二个 `session/event` 处理者后，旧 mock 会吞掉捕获处理器，造成 FAIL(8) 假红）

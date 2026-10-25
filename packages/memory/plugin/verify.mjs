@@ -55,11 +55,11 @@ const mod = await import(new URL('./index.mjs', import.meta.url).href)
 console.log('VERSION     = ' + (mod.VERSION || '(未标注)'))
 
 let contextEntry = null
-let eventHandler = null
+let eventHandlers = []
 let llmHandler = null
 const fakeCtx = {
   systemPrompt: { context(c) { contextEntry = c; return () => {} } },
-  on(name, handler) { if (name === 'session/event') eventHandler = handler;
+  on(name, handler) { if (name === 'session/event') { (eventHandlers = eventHandlers || []).push(handler) };
                       if (name === 'llm/stream') llmHandler = handler; return () => {} },
 }
 
@@ -175,9 +175,9 @@ if (typeof eventHandler !== 'function') {
 // 喂三条: 1 条压缩摘要(该捕获) + 1 条普通消息(不该) + 1 条重复(该去重)
 const s = { id: 'session-00000000-dead-beef-0000-000000000000' }
 const ckpt = 'This is an automatically generated checkpoint condensing an earlier span of the conversation. ' + 'x'.repeat(200)
-eventHandler(s, { type: 'user/message', seq: 4242, time: Date.now(), data: { role: 'user', content: [{ type: 'text', text: ckpt }] } })
-eventHandler(s, { type: 'user/message', seq: 4243, time: Date.now(), data: { role: 'user', content: [{ type: 'text', text: '普通用户消息，不该被当成压缩摘要捕获。' }] } })
-eventHandler(s, { type: 'user/message', seq: 4242, time: Date.now(), data: { role: 'user', content: [{ type: 'text', text: ckpt }] } })
+for (const h of eventHandlers) h(s, { type: 'user/message', seq: 4242, time: Date.now(), data: { role: 'user', content: [{ type: 'text', text: ckpt }] } })
+for (const h of eventHandlers) h(s, { type: 'user/message', seq: 4243, time: Date.now(), data: { role: 'user', content: [{ type: 'text', text: '普通用户消息，不该被当成压缩摘要捕获。' }] } })
+for (const h of eventHandlers) h(s, { type: 'user/message', seq: 4242, time: Date.now(), data: { role: 'user', content: [{ type: 'text', text: ckpt }] } })
 
 // 等子进程报错退出并写日志
 await new Promise((r) => setTimeout(r, 2500))
@@ -256,10 +256,10 @@ let encodingOK = false
     "[System.IO.File]::WriteAllText('" + argsPath.replace(/'/g, "''") + "', $line, (New-Object System.Text.UTF8Encoding $false))",
   ].join('\r\n'), 'utf8')
 
-  let encHandler = null
+  let encHandlers = []
   const encCtx = {
     systemPrompt: { context() { return () => { } } },
-    on(n, h) { if (n === 'session/event') encHandler = h; return () => { } },
+    on(n, h) { if (n === 'session/event') { (encHandlers = encHandlers || []).push(h) }; return () => { } },
   }
   const dispose2 = mod.apply(encCtx, {
     replicaPath,
@@ -267,8 +267,8 @@ let encodingOK = false
     logPath: join(tmpdir(), 'dsh-mem-verify-enc.log'),
     machine: 'NODE-A',
   })
-  if (typeof encHandler === 'function') {
-    encHandler(s, { type: 'user/message', seq: 8888, time: Date.now(), data: { role: 'user', content: [{ type: 'text', text: ckpt }] } })
+  if (encHandlers.length > 0) {
+    for (const h of encHandlers) h(s, { type: 'user/message', seq: 8888, time: Date.now(), data: { role: 'user', content: [{ type: 'text', text: ckpt }] } })
     await new Promise((r) => setTimeout(r, 4000))
     let got = ''
     try { got = readFileSync(argsPath, 'utf8') } catch (e) { }

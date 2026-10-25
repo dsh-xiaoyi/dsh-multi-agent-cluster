@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-bridge",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "type": "module",
   "main": "index.mjs",
   "description": "把三台机器共用的 DSH 长期记忆注入每个会话的系统提示 —— 新会话不再是白纸。",
