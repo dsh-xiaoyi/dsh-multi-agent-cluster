@@ -32,7 +32,12 @@ const here = dirname(fileURLToPath(import.meta.url))
 // 免得"配置路径不对"被误报成"插件坏了"。
 const candidates = [
   process.env.DSH_MEM_REPLICA,
+  // 2026-10-25 FIX: 安装目录不一定在 C:\dsh-mem；与 index.mjs 的 PATH_CANDIDATES 保持一致，
+  //   否则换台机器（例如装在 G:\deepseek）时 verify 找不到副本，误报 exit=2。
   'C:\\dsh-mem\\dsh-mem-replica.json',
+  'G:\\deepseek\\dsh-mem-replica.json',
+  'E:\\deepseek\\dsh-mem-replica.json',
+  'D:\\deepseek\\dsh-mem-replica.json',
   process.env.DSH_MEM_HOME ? join(process.env.DSH_MEM_HOME, 'dsh-mem-replica.json') : null,
   join(here, 'dsh-mem-replica.json'),
 ].filter(Boolean)
