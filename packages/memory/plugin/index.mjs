@@ -47,7 +47,7 @@ import os, { tmpdir } from 'node:os'   // 2026-10-25 修：之前只取了 tmpdi
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export const VERSION = '0.5.1'
+export const VERSION = '0.5.2'
 export const name = 'dsh-memory-bridge'
 export const inject = ['systemPrompt']
 
