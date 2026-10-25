@@ -168,7 +168,7 @@ if (actIdx < 0) {
 }
 
 if (typeof eventHandler !== 'function') {
-  console.log('eventHandler= 未挂上（旧版插件没有自动捕获；若你的版本应含此功能请检查）')
+  console.log('eventHandler= 未挂上（v0.5.4+ 自动捕获改走 spool：C:\\dsh-mem\\spool\\hot.jsonl，这是新架构下的正常结果；要判实时性请测 hot.jsonl 是否增长）')
   console.log('RESULT: PASS (注入部分)')
   process.exit(0)
 }
