@@ -21,7 +21,7 @@
 //   C. ★ 最新一行的 HH:MM 必须等于"用 /Date(毫秒) 独立算出的 UTC 时分"
 //      —— 这条能直接抓住时区偏移（正是我踩的那个坑）
 
-import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, rmSync, readdirSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
@@ -230,8 +230,24 @@ if (actIdx < 0) {
   console.log('rules assert= OK rules@rev=' + core.rev + ' count=' + core.count + ' memories=' + mem[1])
   const det = coreRules('detail')
   if (det && det.ok) {
+    // [VERIFY-DET15-FIX-20261106] detail prompt 若与 conventions 源文本（conventions.md + conventions.d\*.md）相同/被包含，
+    // 它在注入文本里出现是"conventions 正文本来就有这句"，不是 detail 规则泄漏 ⇒ 豁免；只有源文本里没有的 detail prompt 出现才算真泄漏
+    let legitSrc = ''
+    try { legitSrc = readFileSync('C:\\dsh-mem\\conventions.md', 'utf8') } catch (e) {}
+    try {
+      const frags = readdirSync('C:\\dsh-mem\\conventions.d').filter(f => f.endsWith('.md'))
+      for (const fr of frags) { try { legitSrc += '\n' + readFileSync(join('C:\\dsh-mem\\conventions.d', fr), 'utf8') } catch (e) {} }
+    } catch (e) {}
+    // [VERIFY-DET15-WARN-20261106] legitSrc 为空=conventions.md/分片读不到 ⇒ 豁免会全体失效 ⇒ 必须显式告警，不许静默
+    if (!legitSrc || legitSrc.length === 0) { console.log('WARN legitSrc=EMPTY — conventions.md / conventions.d 读不到，豁免失效，FAIL(15) 将回归全量误报') }
     for (const r of det.rules) {
-      if (text.indexOf(r.prompt) >= 0) { console.error('FAIL(15): detail 规则泄漏进 core 注入: ' + r.name); process.exit(15) }
+      if (text.indexOf(r.prompt) >= 0) {
+        if (legitSrc.indexOf(r.prompt) >= 0) {
+          console.log('detail skip(legit-in-conventions)= ' + r.name)
+        } else {
+          console.error('FAIL(15): detail 规则泄漏进 core 注入: ' + r.name); process.exit(15)
+        }
+      }
     }
     console.log('detail assert= OK leaked=0 (checked ' + det.count + ' detail rows)')
   }

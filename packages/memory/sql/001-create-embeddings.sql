@@ -1,5 +1,5 @@
 ﻿-- dbo.embeddings -- F plan (semantic recall) storage, per DESIGN-F proposal section 3.
--- Owner of this DDL: 192.0.2.11 (the memory DB host).  Created 2026-10-06.
+-- Target of this DDL: the memory DB host.  Created 2026-10-06.
 -- Why the PK is (item_type, item_id, model): models can coexist / be compared /
 -- be rolled out gradually, and re-embedding is a plain upsert per model.
 IF OBJECT_ID('dbo.embeddings') IS NULL

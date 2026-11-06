@@ -14,7 +14,7 @@ BEGIN
     username    NVARCHAR(160) NULL,
     secret      NVARCHAR(MAX) NULL,              -- 明文（R39 授权）
     extra       NVARCHAR(MAX) NULL,              -- 备注/JSON：端口、驱动、用途、关联
-    source_ref  NVARCHAR(160) NULL,              -- 来源：'[922]' / 'artifact 1304' / 'owner 2026-10-11'
+    source_ref  NVARCHAR(160) NULL,              -- 来源：'[922]' / 'artifact 1304' / '2026-10-11'
     is_active   BIT NOT NULL CONSTRAINT DF_credentials_active DEFAULT (1),
     created_at  DATETIME2(0) NOT NULL CONSTRAINT DF_credentials_created DEFAULT (SYSUTCDATETIME()),
     updated_at  DATETIME2(0) NOT NULL CONSTRAINT DF_credentials_updated DEFAULT (SYSUTCDATETIME())

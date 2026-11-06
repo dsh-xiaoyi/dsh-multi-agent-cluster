@@ -7,7 +7,7 @@
 #        dsh plugin --profile desktop add "link:C:\dsh-mem\dsh-memory-bridge"
 #   3. 重启 DSH（新插入的 bundle 条目在重启前是 inactive —— 已实测确认）
 #   4. 验证: 在浏览器开一个全新会话，问"你知道我们在做什么吗"
-#      如果它答得出三台机器共享记忆里的事，说明注入生效
+#      如果它答得出共享记忆里的事，说明注入生效
 - insert:
     - id: dsh-memory-bridge
       name: dsh-memory-bridge

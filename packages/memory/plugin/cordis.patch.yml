@@ -7,15 +7,20 @@
 #        dsh plugin --profile desktop add "link:C:\dsh-mem\dsh-memory-bridge"
 #   3. 重启 DSH（新插入的 bundle 条目在重启前是 inactive —— 已实测确认）
 #   4. 验证: 在浏览器开一个全新会话，问"你知道我们在做什么吗"
-#      如果它答得出三台机器共享记忆里的事，说明注入生效
+#      如果它答得出共享记忆里的事，说明注入生效
 - insert:
     - id: dsh-memory-bridge
       name: dsh-memory-bridge
       config:
+        stateDir: 'C:\dsh-mem\sessions'
+        stateMaxChars: 3600
+        # 注入的状态卡条数；statePinned 里的卡片优先钉住，不会被其他卡片挤掉
+        stateCards: 2
+        statePinned: '(要求|承诺|生活|PROMISES)'
         replicaPath: 'C:\dsh-mem\dsh-mem-replica.json'
         cliPath: 'C:\dsh-mem\dsh-mem.ps1'
         limit: 8
-        maxChars: 16000          # 2026-10-24: 2400 太小，会把活动段/定义型记忆整段截掉
-        conventionsMax: 3000      # 关键约定单独限长，超出时标注'已截断'
+        maxChars: 16000          # 太小会把活动段/定义型记忆整段截掉
+        conventionsMax: 3000     # 关键约定单独限长，超出时标注「已截断」
         refreshMs: 60000
         spoolMaxBytes: 1073741824

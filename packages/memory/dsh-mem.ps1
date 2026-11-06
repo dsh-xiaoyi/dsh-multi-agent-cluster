@@ -261,7 +261,7 @@ function Get-Text([object]$content) {
 }
 
 function Protect-Text([string]$t) {
-  # 2026-10-22 OWNER POLICY (memory 22589): local files and the DB are NOT redacted.
+  # 2026-10-22 RETENTION POLICY (memory 22589): local files and the DB are NOT redacted.
   # The old implementation rewrote stored text (sk-*, password=..., Dsh..#...) which silently
   # destroyed conversation records -- that was a direct cause of the "amnesia".
   # Kept as a function so every caller keeps working; it is now a pass-through.
@@ -984,11 +984,11 @@ switch ($Command.ToLower()) {
 
     $inTitleLen = $Title.Length
     $inBodyLen  = ([string]$Body).Length
-# OWNER-AUTHORISED CREDENTIAL STORE (rules R39, user decision 2026-10-07).  kind='secret' is the one
-# deliberate exception to "never store a secret in this database": the owner asked for their own
+# AUTHORISED CREDENTIAL STORE (rules R39, user decision 2026-10-07).  kind='secret' is the one
+# deliberate exception to "never store a secret in this database": the user asked for their own
 # passwords to live here so they are not forgotten.  Every other kind is still redacted on write.
 if ([string]$Kind -eq 'secret') {
-  Write-Host "  * SECRET MODE: stored in CLEAR TEXT on purpose (owner authorisation, rules R39)"
+  Write-Host "  * SECRET MODE: stored in CLEAR TEXT on purpose (user authorisation, rules R39)"
   Write-Host "    readable by every machine/login that shares this database; never copy it to a shared folder"
   Write-Host "    read it back with:  dsh-mem.ps1 secrets [<keyword>]"
 } else {
@@ -1550,7 +1550,7 @@ WHERE e.model = @model AND r.rn > 1
   }
 
   'secrets' {
-    # Owner-authorised clear-text credential list (rules R39).  Deliberately does NOT run Protect-Text:
+    # Authorised clear-text credential list (rules R39).  Deliberately does NOT run Protect-Text:
     # the whole point is to read the stored value back.  Local-only; the banner says what not to do.
     $pat = [string]$Target
     if ($pat) { $rows = Invoke-Rows -Sql "SELECT TOP 300 id, subject, title, body, tags, CONVERT(varchar(19), created_at, 120) AS at FROM dbo.memories WHERE kind='secret' AND (subject LIKE '%'+@p+'%' OR title LIKE '%'+@p+'%' OR body LIKE '%'+@p+'%' OR tags LIKE '%'+@p+'%') ORDER BY id DESC" -Params @{ '@p' = $pat } }
@@ -1686,10 +1686,10 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
       [void]$sb.AppendLine("**" + ([datetime]$m.created_at).ToLocalTime().ToString('HH:mm') + " " + $m.role + "**: " + $txt)
       [void]$sb.AppendLine("")
     }
-    [void]$sb.AppendLine("## 二、共享记忆里最新的结论（三台一致）")
+    [void]$sb.AppendLine("## 二、共享记忆里最新的结论（各节点一致）")
     [void]$sb.AppendLine("")
     foreach ($k in @($mems)) {
-# OWNER CREDENTIALS (rule R39): this brief is written to be carried to ANOTHER machine, so a
+# CREDENTIALS (rule R39): this brief is written to be carried to ANOTHER machine, so a
 # kind='secret' memory shows only a placeholder here.
       if ([string]$k.kind -eq 'secret') {
         $b = '[secret: value not exported -- read it with: dsh-mem.ps1 secrets]'
@@ -1731,7 +1731,7 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
     #   execute : dsh-mem.ps1 prune -Force
     $days = if ($Target) { [int]$Target } else { 90 }
     if ($Force -and -not $AllowMessagePrune) {
-      Write-Host '  REFUSED: raw conversation messages are permanently retained (owner 2026-10-25).'
+      Write-Host '  REFUSED: raw conversation messages are permanently retained (2026-10-25).'
       Write-Host '           pass -AllowMessagePrune only if you really intend to delete them.'
       return
     }
@@ -1769,7 +1769,7 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
     # Redact every content-bearing field BEFORE serialising.  Doing it on the JSON string would
     # miss values that JSON escapes, and this file is read by other tools/machines.
 foreach ($r in @($mem)) {
-  # OWNER CREDENTIALS (rule R39): this file is copied around far more easily than the database, so a
+  # CREDENTIALS (rule R39): this file is copied around far more easily than the database, so a
   # kind='secret' row is exported as a PLACEHOLDER -- the entry's existence stays visible, its value does not.
   if ([string]$r.kind -eq 'secret') {
     $r.title = '[secret: value not exported]'
@@ -1835,7 +1835,7 @@ foreach ($r in @($rows)) {
     Write-Host ""
     Write-Host "  sync    [<session.v4.jsonl.zstd>] [-All] [-NoTools] [-Force]   import session log (tool events INCLUDED by default since 1.3.1; -NoTools opts out)(s)"
     Write-Host "  save    -Title '...' -Body '...' [-Tags a,b] [-Scope machine] [-Subject X] [-Kind fact|secret]"
-Write-Host "          -Kind secret is the OWNER's clear-text credential store (rules R39) -- read it with: secrets"
+Write-Host "          -Kind secret is the USER's clear-text credential store (rules R39) -- read it with: secrets"
     Write-Host "          -TitleFile <f> -BodyFile <f>  <- use these for long text or text with quotes"
     Write-Host "                                          (a body with an odd number of `" makes"
     Write-Host "                                           powershell -File fail silently, exit 2)"
