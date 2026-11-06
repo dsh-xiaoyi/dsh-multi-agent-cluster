@@ -47,6 +47,7 @@ import os, { tmpdir } from 'node:os'   // 2026-10-25 修：之前只取了 tmpdi
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+// R1-MARKER 2026-10-26: state cards 3->2 + pinned-card support (autonomous change, reviewed)
 export const VERSION = '0.5.4'
 export const name = 'dsh-memory-bridge'
 export const inject = ['systemPrompt']
@@ -168,7 +169,7 @@ export function apply(ctx, config) {
   // 2026-10-25 state card: inject the most recently updated session state files
   const stateDir = String(config.stateDir || 'C:\\dsh-mem\\sessions')
   const stateMaxChars = Number(config.stateMaxChars || 2400)
-  const stateCards = Number(config.stateCards || 3)
+  const stateCards = Number(config.stateCards || 2)   // R1 2026-10-26: 3 -> 2 (each card ~900B, was dominating maxChars)
   // 2026-10-25 anchor pointers: inject the freshest exact anchors (session + seq) for lossless readback
   const anchorPath = String(config.anchorPath || 'C:\\dsh-mem\\anchors\\LATEST.md')
   const anchorMaxChars = Number(config.anchorMaxChars || 900)
@@ -184,6 +185,26 @@ export function apply(ctx, config) {
   const embedModel    = config.embedModel || 'bge-m3'
   // 2026-10-25 r8（18 指出）：`injector=0.5.0` 从 r1 到 r7 一直没变 ⇒ **不携带"哪个 build"的信息**。
   //   改为 injector=0.5.0-<本文件 sha16 前 8 位>，自证 build；任何探针必须能区分相邻版本。
+  // R6 2026-10-27: 让 INJECT-SELFID 自带"运行实例实际读的 profile 目录"与 patch 指纹（sha16 用于对账，内容谓词用于验收）
+  const PROFILE_DIR = (function () {
+    try {
+      const a = process.argv || []
+      for (const x of a) { if (typeof x === 'string' && /[\\/]\.dsh[\\/]profiles[\\/]/i.test(x)) return String(x) }
+      const h = String(process.env.DSH_HOME || '').replace(/[\\/]+$/, '')
+      const p = String(process.env.DSH_PROFILE || 'desktop')
+      if (h) return h + '\\profiles\\' + p
+    } catch (e) {}
+    return ''
+  })()
+  const PROFILE_PATCH_SHA = (function () {
+    try {
+      if (!PROFILE_DIR) return 'NA'
+      const p = String(PROFILE_DIR).replace(/[\\/]+$/, '') + '\\cordis.patch.yml'
+      const b = readFileSync(p)
+      return createHash('sha256').update(b).digest('hex').slice(0, 16).toUpperCase()
+    } catch (e) { return 'ERR' }
+  })()
+
   const SELF_BUILD = (function () {
     try {
       const b = readFileSync(new URL(import.meta.url))
@@ -198,7 +219,7 @@ export function apply(ctx, config) {
     try {
       let adminGroupOk = null
       try {
-        const r2 = spawnSync('whoami', ['/groups', '/fo', 'csv', '/nh'], { encoding: 'utf8', timeout: 4000 })
+        const r2 = spawnSync('whoami', ['/groups', '/fo', 'csv', '/nh'], { encoding: 'utf8', timeout: 4000, windowsHide: true })
         if (r2 && r2.stdout) adminGroupOk = /S-1-5-32-544/.test(r2.stdout)
       } catch (e) { }
       return {
@@ -225,7 +246,7 @@ export function apply(ctx, config) {
   }
   if (CONFIG_PROBLEMS.length) log('INJECT-CONFIG-FAIL ' + CONFIG_PROBLEMS.join(' ; '))
   const refreshMs   = Number(config.refreshMs || 60000)
-  const heading     = config.heading || '共享长期记忆（三台机器共用）'
+  const heading     = config.heading || '共享长期记忆（多台共用）'
   const activity    = config.activity !== false
   const activityMax = Number(config.activityMax || 6)
 
@@ -240,9 +261,13 @@ export function apply(ctx, config) {
   const captured = new Set()
 
   function log(msg) {
+    // [LOG-ROTATE-20261105] 与 agent 桥对齐：日志到 512KB 就改名 .1，防止无限增长
+    try { if (logPath && existsSync(logPath) && statSync(logPath).size > 524288) { renameSync(logPath, logPath + '.1') } } catch (e) { }
     const line = new Date().toISOString() + '  ' + msg + '\n'
     try { if (logPath) writeFileSync(logPath, line, { flag: 'a' }) } catch (e) { }
     // INJECT-* 另外写一份到 inject.log，便于审计注入了什么、是否被截断（2026-10-24）
+    // [INJECT-ROTATE-20261105] inject.log 同样无上限（23:46 已 12.58MB）⇒ 4MB 轮转
+    try { if (injectLogPath && existsSync(injectLogPath) && statSync(injectLogPath).size > 4194304) { renameSync(injectLogPath, injectLogPath + '.1') } } catch (e) { }
     try { if ((msg.indexOf('INJECT-') === 0 || msg.indexOf('SEMANTIC-') === 0 || msg.indexOf('PATH-') === 0 || msg.indexOf('CONVENTIONS-') === 0) && injectLogPath) writeFileSync(injectLogPath, line, { flag: 'a' }) } catch (e) { }
   }
 
@@ -305,33 +330,58 @@ export function apply(ctx, config) {
           corePrompts = []
         } else {
           const coreOut = join(tmpdir(), 'dsh-mem-core-rules-' + process.pid + '.json')
+          // [CORE-RULES-CACHE-20261106] 缓存优先：spool\core-rules.json 新鲜(<=10min)且 ok 就直接用，省掉每轮 spawn powershell
+          const CACHE_PATH = 'C:\\dsh-mem\\spool\\core-rules.json'
+          const CACHE_MAX_AGE_MS = 10 * 60 * 1000
           let rr = null
-          for (let attempt = 1; attempt <= 2; attempt++) {
-            try { rmSync(coreOut, { force: true }) } catch (e) {}
-            const t0 = Date.now()
-            rr = spawnSync(powershell, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', coreRulesPath, '-Tier', 'core', '-OutFile', coreOut], { encoding: 'utf8', timeout: 30000 })
-            coreMs = Date.now() - t0
-            const okR = !!(rr && rr.status === 0 && existsSync(coreOut))
-            if (!okR) {
-              try {
-                log('INJECT-RULES-RETRY attempt=' + attempt + ' status=' + (rr && rr.status) + ' signal=' + (rr && rr.signal) + ' error=' + JSON.stringify(rr && rr.error ? String(rr.error.message || rr.error) : null) + ' elapsedMs=' + coreMs + ' ok=' + okR)
-              } catch (e) {}
+          let cacheHit = false
+          let cj = null
+          try {
+            if (existsSync(CACHE_PATH)) {
+              const st = statSync(CACHE_PATH)
+              const ageMs = Date.now() - st.mtimeMs
+              const cj0 = JSON.parse(readFileSync(CACHE_PATH, 'utf8'))
+              if (cj0 && cj0.ok === true && ageMs >= 0 && ageMs <= CACHE_MAX_AGE_MS) { cj = cj0; cacheHit = true; coreMs = 0 }
             }
-            if (okR) break
-            if (attempt < 2) {
-              try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000) } catch (e) {}
+          } catch (e) { cj = null }
+          if (cacheHit && cj) {
+            coreRev = Number(cj.rev) || 0
+            coreExpect = Number(cj.expect) || 0
+            corePrompts = (Array.isArray(cj.rules) ? cj.rules : []).map(function (x) { return String(x.prompt || '') }).filter(Boolean)
+            coreGot = corePrompts.length
+            coreCount = coreGot
+            log('INJECT-RULES-CACHE source=cache rev=' + coreRev + ' got=' + coreGot)
+          } else {
+            for (let attempt = 1; attempt <= 2; attempt++) {
+              try { rmSync(coreOut, { force: true }) } catch (e) {}
+              const t0 = Date.now()
+              rr = spawnSync(powershell, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', coreRulesPath, '-Tier', 'core', '-OutFile', coreOut], { encoding: 'utf8', timeout: 30000, windowsHide: true })
+              coreMs = Date.now() - t0
+              const okR = !!(rr && rr.status === 0 && existsSync(coreOut))
+              if (!okR) {
+                try {
+                  log('INJECT-RULES-RETRY attempt=' + attempt + ' status=' + (rr && rr.status) + ' signal=' + (rr && rr.signal) + ' error=' + JSON.stringify(rr && rr.error ? String(rr.error.message || rr.error) : null) + ' elapsedMs=' + coreMs + ' ok=' + okR)
+                } catch (e) {}
+              }
+              if (okR) break
+              if (attempt < 2) {
+                try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000) } catch (e) {}
+              }
             }
+            if (rr && rr.status === 0 && existsSync(coreOut)) {
+              const cjSpawn = JSON.parse(readFileSync(coreOut, 'utf8'))
+              if (cjSpawn && cjSpawn.ok) {
+                coreRev = Number(cjSpawn.rev) || 0
+                coreExpect = Number(cjSpawn.expect) || 0
+                corePrompts = (Array.isArray(cjSpawn.rules) ? cjSpawn.rules : []).map(function (x) { return String(x.prompt || '') }).filter(Boolean)
+                coreGot = corePrompts.length
+                coreCount = coreGot
+                log('INJECT-RULES-CACHE source=spawn rev=' + coreRev + ' got=' + coreGot)
+                // 自暖：spawn 成功后回写共享缓存，供下一轮注入复用
+                try { writeFileSync(CACHE_PATH, readFileSync(coreOut, 'utf8'), 'utf8') } catch (e) {}
+              } else { coreErr = String((cjSpawn && cjSpawn.error) || 'helper-not-ok') }
+            } else { coreErr = 'helper-fail' }
           }
-          if (rr && rr.status === 0 && existsSync(coreOut)) {
-            const cj = JSON.parse(readFileSync(coreOut, 'utf8'))
-            if (cj && cj.ok) {
-              coreRev = Number(cj.rev) || 0
-              coreExpect = Number(cj.expect) || 0
-              corePrompts = (Array.isArray(cj.rules) ? cj.rules : []).map(function (x) { return String(x.prompt || '') }).filter(Boolean)
-              coreGot = corePrompts.length
-              coreCount = coreGot
-            } else { coreErr = String((cj && cj.error) || 'helper-not-ok') }
-          } else { coreErr = 'helper-fail' }
         }
       } catch (e) { coreErr = String((e && e.message) || e) }
 
@@ -368,7 +418,7 @@ export function apply(ctx, config) {
           const body = JSON.stringify({ model: embedModel, input: String(text).slice(0, 2000) })
           const t0 = Date.now()
           const res = spawnSync('curl.exe', ['-s', '--max-time', '12', '-X', 'POST', ollamaUrl + '/api/embed',
-            '-H', 'Content-Type: application/json', '--data-binary', body], { encoding: 'utf8', timeout: 15000 })
+            '-H', 'Content-Type: application/json', '--data-binary', body], { encoding: 'utf8', timeout: 15000, windowsHide: true })
           if (!res || res.status !== 0 || !res.stdout) {
             vecState.why = 'curl-fail'
             semanticSkipUntil = Date.now() + semBackoffMs
@@ -413,7 +463,7 @@ export function apply(ctx, config) {
       lines.push('')
       lines.push('> **强制指令（每次会话第一眼看这条）**：回答任何"以前怎么定的 / 约定 / 规则"类问题之前，必须先查记忆库，不许凭印象。')
       lines.push('>   powershell -ExecutionPolicy Bypass -File "' + cliPath + '" search <关键词>')
-      lines.push('> 并读 C:\\dsh-mem\\conventions.md（长期硬约定，全部有效）。查不到就问主人，不要猜。')
+      lines.push('> 并读 C:\\dsh-mem\\conventions.md（长期硬约定，全部有效）。查不到就问用户，不要猜。')
       lines.push('来源: 本机离线副本，刷新于 ' + (raw.generatedAt || '?') + '；库主机 ' + (raw.server || '?') + '；共 ' + mems.length + ' 条记忆')
       if (SELF_ID) {
         lines.push('本机身份（注入器实测，非记载值）: ' + SELF_ID.host + ' ｜ ' + SELF_ID.os + ' ｜ 登录用户 ' + SELF_ID.user +
@@ -588,7 +638,7 @@ export function apply(ctx, config) {
             // 版本尾巴：不回写文件，只在注入末尾追加一行；机器可 grep：conventions@
             // 2026-10-24 r6（18 指出）：注入内容必须幂等 —— 尾巴不带时间戳，时间只进 inject.log
             SECTIONS.conv.push('<!-- conventions@' + convSha16 + ' size=' + convSize + 'B chars=' + conv.length + '/' + conventionsMax + (convTruncated ? ' TRUNCATED' : '') + ' injector=0.5.0-' + SELF_BUILD + ' -->')
-            log('INJECT-TAIL conventions@' + convSha16 + ' size=' + convSize + 'B chars=' + conv.length + '/' + conventionsMax + (convTruncated ? ' TRUNCATED' : '') + ' injector=0.5.0-' + SELF_BUILD + ' at=' + new Date().toISOString())
+            log('INJECT-TAIL pid=' + process.pid + ' conventions@' + convSha16 + ' size=' + convSize + 'B chars=' + conv.length + '/' + conventionsMax + (convTruncated ? ' TRUNCATED' : '') + ' injector=0.5.0-' + SELF_BUILD + ' at=' + new Date().toISOString())
           }
           // ---- 关键约定分片：只注入命中当前话题关键词的分片，其余仅列名字（2026-10-24）----
           try {
@@ -670,7 +720,13 @@ export function apply(ctx, config) {
             } catch (e) { }
           }
           cards.sort(function (a, b) { return b.m - a.m })
-          const pick = cards.slice(0, Math.max(1, stateCards))
+          // R1 2026-10-26: pin cards whose text matches config.statePinned (regex) so requirement cards never lose to recency
+          let pinned = []
+          try {
+            const pinRe = config.statePinned ? new RegExp(String(config.statePinned), 'i') : null
+            if (pinRe) pinned = cards.filter(function (c) { try { return pinRe.test(readFileSync(c.p, 'utf8')) } catch (e) { return false } })
+          } catch (e) { pinned = [] }
+          const pick = (pinned.slice(0, 1).concat(cards.filter(function (c) { return pinned.length === 0 || c.d !== pinned[0].d }))).slice(0, Math.max(1, stateCards))
           if (pick.length) {
             SECTIONS.state.push('')
             SECTIONS.state.push('### 会话状态卡（每轮注入；按标题认领你自己的那张）')
@@ -814,7 +870,7 @@ export function apply(ctx, config) {
       digest = text
       try {
         const rulesPartial = coreExpect !== coreGot
-        log('INJECT-RULES ' + JSON.stringify({ rev: coreRev, expect: coreExpect, got: coreGot, count: coreCount, partial: rulesPartial, memories: mems.length, core_empty: coreCount === 0, mem_empty: mems.length === 0, ms: coreMs, error: coreErr || undefined }))
+        log('INJECT-RULES ' + JSON.stringify({ pid: process.pid, rev: coreRev, expect: coreExpect, got: coreGot, count: coreCount, partial: rulesPartial, memories: mems.length, core_empty: coreCount === 0, mem_empty: mems.length === 0, ms: coreMs, error: coreErr || undefined }))
         if (rulesPartial) log('RULES-PARTIAL expect=' + coreExpect + ' got=' + coreGot)
       } catch (e) {}
     } catch (e) {
@@ -843,7 +899,7 @@ export function apply(ctx, config) {
     // 2026-10-25 r7（18 指出）：**哪个配置生效只能用运行时自报证明**，不能用文件内容推断
   // 2026-10-25 r9：两条诊断日志各自独立 try —— 之前共用一个 try，一条抛错另一条也静默消失（无法定位）
   try {
-    log('INJECT-SELFID ' + (SELF_ID ? (String(SELF_ID.host) + ' | ' + String(SELF_ID.os) + ' | ' + String(SELF_ID.user) + ' | admin=' + String(SELF_ID.admin)) : 'NULL') + ' build=' + String(SELF_BUILD))
+    log('INJECT-SELFID pid=' + process.pid + ' profileDir=' + PROFILE_DIR + ' patch=' + PROFILE_PATCH_SHA + ' ' + (SELF_ID ? (String(SELF_ID.host) + ' | ' + String(SELF_ID.os) + ' | ' + String(SELF_ID.user) + ' | admin=' + String(SELF_ID.admin)) : 'NULL') + ' build=' + String(SELF_BUILD))
   } catch (e) { log('INJECT-SELFID-FAIL ' + String((e && e.message) || e)) }
   try {
     log('INJECT-EFFCONFIG ' + JSON.stringify({ maxChars: Number(maxChars), conventionsMax: Number(conventionsMax), requiredMin: REQUIRED_MIN, shardCap: Number(config.shardCap || 3), semantic: (config.semantic === false ? false : true), maxCharsSource: (config.maxChars ? 'config' : 'code-default') }))
@@ -1034,7 +1090,7 @@ export function apply(ctx, config) {
   }
 
   // ---------------- 3) account for LOCAL model calls ----------------
-  // 用户要求: 本地模型的调用要记进共享记忆，让三台都能看到。
+  // 用户要求: 本地模型的调用要记进共享记忆，让各节点都能看到。
   // llm/stream 是所有模型调用的唯一必经点（waterfall），可读到
   // options.provider / model / sessionId / purpose，并可包装流以捕获 usage。
   // ★ 只记【本地提供方】的调用 —— 否则每个 agent step 写一行会把记忆库淹掉。

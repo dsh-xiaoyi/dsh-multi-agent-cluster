@@ -5,8 +5,8 @@
 #   the composition never contains the plugin, nothing logs, nothing errors.
 #   Reference: dsh-memory-bridge/cordis.patch.yml uses exactly the shape below.
 #
-# The token is NOT here (R46): it is read at runtime from an admin-only file produced from the
-# vault.   vault name: bridge-token-11to18     file: C:\dsh-mem\agent-bridge.token
+# The token is NOT here: it is read at runtime from an admin-only file produced from the
+# vault.   vault name: bridge-token-hub-to-node     file: C:\dsh-mem\agent-bridge.token
 #
 # logPath is the proof of life: "installed" is not "loaded".
 - insert:
@@ -14,38 +14,31 @@
       name: dsh-agent-bridge
       config:
         path: /agent/inbox
-        # SENDER whitelist (default-deny): the cluster is MUTUAL - 11, 17 and 18 may each send
-        # to the others (owner's decision, recorded in [12071], supersedes the only-11 round).
+        # SENDER whitelist (default-deny). Every node that may send to this relay must be
+        # listed here — the cluster is MUTUAL, not hub-only.
         allowedFrom:
-          # 2026-10-22 规范化：库内权威机器名（大小写敏感）
-          - 'NODE-A'
-          - 'NODE-B'
-          - 'NODE-C'
-          # 历史别名（兼容旧消息，勿再新增使用）
-          - 'node-b'
+          # canonical machine names first (case-sensitive)
+          - '<COMPUTERNAME-A>'
+          - '<COMPUTERNAME-B>'
+          - '<COMPUTERNAME-C>'
+          # historical aliases (compat only; do not add new ones)
+          - '<computer-name-b>'
           - '<agent-host>'
         token: ''
         tokenFile: 'C:\dsh-mem\agent-bridge.token'
-        # R49(1) ACTIVE 2026-10-13: per-peer tokens from the ACL-tight file (never from config; R46).
+        # per-peer tokens come from the ACL-tight file (never from config)
         peerTokensFile: 'C:\dsh-mem\bridge-peers.json'
         logPath: 'C:\dsh-mem\dsh-agent-bridge\bridge.log'
+        # Local injection targets: alias -> a (parent,child) session pair.
+        # An alias not registered here answers 404 by design.
         localTargets:
-          '11/selftest':
-            parentSessionId: 'session-a3b14127-d25b-42fd-9989-55b3a48296ef'
-            childSessionId: 'fe79a3f0-cb1e-4ffd-9c95-8c63045c6e61'
-          # ---- 2026-10-13: a properly NAMED cluster inbox so peers can address each other by convention
-          # ('<COMPUTERNAME>/agent-1' style) instead of the historical '11/selftest' name.
-          # Same (parent,child) pair as 11/selftest: both names hit the same live continuable child.
-            # 2026-10-22: IP 作为传输层标识（稳定、大小写无关、无 CJK 编码风险）
+          '<HUB>/selftest':
+            parentSessionId: 'session-<PARENT-ID>'
+            childSessionId: 'child-<CHILD-ID>'
           '192.0.2.11/agent-1':
-            parentSessionId: 'session-a3b14127-d25b-42fd-9989-55b3a48296ef'
-            childSessionId: 'fe79a3f0-cb1e-4ffd-9c95-8c63045c6e61'
-          '11/ops':
-            parentSessionId: 'session-a3b14127-d25b-42fd-9989-55b3a48296ef'
-            childSessionId: 'fe79a3f0-cb1e-4ffd-9c95-8c63045c6e61'
-          # 2026-10-22: 规范收件名（COMPUTERNAME），修复对端 404
-          'NODE-A/agent-1':
-            parentSessionId: 'session-a3b14127-d25b-42fd-9989-55b3a48296ef'
-            childSessionId: 'fe79a3f0-cb1e-4ffd-9c95-8c63045c6e61'
+            parentSessionId: 'session-<PARENT-ID>'
+            childSessionId: 'child-<CHILD-ID>'
+          '<HUB>/ops':
+            parentSessionId: 'session-<PARENT-ID>'
+            childSessionId: 'child-<CHILD-ID>'
         peers: {}
-  # touch 2026-10-23 01:40:29 (HMR reload trigger)

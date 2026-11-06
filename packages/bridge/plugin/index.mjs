@@ -1,7 +1,7 @@
 // dsh-agent-bridge — host half (prototype v0.1.0)
 //
-// PLAN B (B1): cross-machine agent messaging for the DSH cluster. Only the relay host
-// (the hub node) opens a LAN port; the other machines may still receive because they run this same
+// PLAN B (B1): cross-machine agent messaging for the DSH fleet. Only the relay host
+// (11) opens a LAN port; the other machines may still receive because they run this same
 // plugin and each injects LOCALLY.
 //
 // WHY LOCAL INJECTION (this is the key design point, verified against the runtime contract):
@@ -42,7 +42,15 @@ export const VERSION = '0.1.1-hotreload'
 export const inject = ['webServer', 'subagents']
 
 const MAX_HOPS = 2
-const DEDUPE_MS = 60_000
+// [DEDUPE-900-20261030] was 60_000. On the slow-disk node (01) a poller retry can arrive 107-300 s
+// after the first POST (the response is lost while the bridge has already injected), so a 60 s
+// window let the SAME wire msgId inject twice (measured: msg 68573dee at 01:26:58 and 01:28:44).
+// 900 s covers the observed retry horizon; the key is a GUID, so a longer window costs no recall.
+const DEDUPE_MS = 900_000
+// [LOGSINK-20261030] module-level sink: refreshTokens() is module-level while fileLog() is
+// declared inside apply(); calling fileLog() from here threw ReferenceError, silently swallowed
+// by the surrounding try/catch => TOKENS-RELOADED was never written. Assign the sink in fileLog().
+let __logSink = null
 const MAX_BODY = 64 * 1024
 const MAX_TEXT = 8 * 1024
 const RATE_PER_MIN = 5
@@ -56,17 +64,17 @@ function normConfig(config = {}) {
     // so it never sits in a world-readable profile config (R46).
     tokenFile: typeof config.tokenFile === 'string' ? config.tokenFile : '',
     // OWN ON-DISK LOG, and why it is not optional:
-    // this cluster already lost time to "installed but ineffective" — a plugin that never
-    // loaded reports nothing and simply does nothing. Per the owner's measured note
+    // this fleet already lost time to "installed but ineffective" — a plugin that never
+    // loaded reports nothing and simply does nothing. Per a measured note
     // (dsh-memory-bridge/README-插件热重载行为.md) a plugin must leave a file marker, so
     // "armed" here is the only trustworthy proof that apply() actually ran in the host.
     logPath: typeof config.logPath === 'string' ? config.logPath : '',
     localTargets: config.localTargets && typeof config.localTargets === 'object' ? config.localTargets : {},
-    // SENDER whitelist (default-deny). The cluster is MUTUAL (owner, 2026-10-12): 11, 17 and 18 may
+    // SENDER whitelist (default-deny). The cluster is MUTUAL (2026-10-12): any listed node may
     // each inject into the others. An empty/absent list means "refuse everything", never "allow all".
     // R49(1) support, staged: a per-peer token map. When configured, the SENDER IS DERIVED FROM
     // THE TOKEN (never from the request body), which is what the rule actually requires. Left
-    // empty until the cluster lays out per-peer tokens, so nothing changes today.
+    // empty until the fleet lays out per-peer tokens, so nothing changes today.
     peerTokens: config.peerTokens && typeof config.peerTokens === 'object' ? config.peerTokens : {},
     // Same principle as tokenFile (R46): the per-peer tokens live in an ACL-tight FILE produced from
     // the vault, never in this config. Format: {"<peer>":"<token>", ...}
@@ -139,7 +147,7 @@ function refreshTokens(cfg, warn) {
     } catch (e) { warn('[agent-bridge] refresh: cannot read peerTokensFile ' + cfg.peerTokensFile + ': ' + (e?.message ?? e)) }
   }
   if (changed) {
-    try { fileLog('TOKENS-RELOADED v' + VERSION + ' peers=' + Object.keys(cfg.peerTokens || {}).length + ' self=' + (__tokenState.token ? 'set' : 'MISSING')) } catch {}
+    try { __logSink && __logSink('TOKENS-RELOADED v' + VERSION + ' peers=' + Object.keys(cfg.peerTokens || {}).length + ' self=' + (__tokenState.token ? 'set' : 'MISSING') + ' marker=[LOGSINK-20261030]') } catch {}
   }
 }
 
@@ -182,6 +190,8 @@ export function apply(ctx, config) {
 
   // Rotate at 512 KB so a chatty bridge cannot fill the disk; never writes message text.
   function fileLog(line) {
+    // [LOGSINK-20261030] expose the writer to module-level code (see __logSink above)
+    __logSink = fileLog
     if (!cfg.logPath) return
     try {
       if (statSync(cfg.logPath, { throwIfNoEntry: false })?.size > 512 * 1024) {
@@ -306,9 +316,14 @@ fileLog('ARMED v' + VERSION + ' path=' + cfg.path + ' targets=' + Object.keys(cf
       if (seen.has(msgId)) return respond(res, 200, { ok: true, deduplicated: true })
       if (!allow(from)) return respond(res, 429, { ok: false, code: 'rate-limited' })
 
-      const target = cfg.localTargets[to]
-      if (!target || !target.parentSessionId || !target.childSessionId) {
-        return respond(res, 404, { ok: false, code: 'unknown-target' })
+        // [SELFDESC-20261106] 404 时把"合法 target 名"一并返回：目标名写错（配置漂移）时，
+        //   对端与轮询器能直接看到正确名字，而不是只收到 {"code":"unknown-target"} 后无脑重试
+        //   （配合 bridge-poll 的 [404-BOUND-20261106]：N 次后转 terminal，避免队列永久积压）
+        const target = cfg.localTargets[to]
+        if (!target || !target.parentSessionId || !target.childSessionId) {
+          const validTargets = Object.keys(cfg.localTargets)
+          log('[agent-bridge] [SELFDESC-20261106] unknown-target to=' + to + ' valid=' + validTargets.join(','))
+          return respond(res, 404, { ok: false, code: 'unknown-target', to, targets: validTargets })
       }
 
       const requestId = randomUUID()

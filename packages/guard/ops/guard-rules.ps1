@@ -1,11 +1,11 @@
 ﻿# 时光守护 · 规则执行器 (guard-rules.ps1)
 #
-# Owner 2026-10-22: the guard program should read its RULES from the database and execute them,
+# 2026-10-22: the guard program should read its RULES from the database and execute them,
 # so policy changes are a data change (auditable, versioned) instead of a script edit. When there is
 # no database it must fall back to the central commander (中枢) for centrally issued rules.
 #
 # Rule sources, in order:
-#   1) DB          dbo.guard_rules (enabled=1)         -- normal cluster operation
+#   1) DB          dbo.guard_rules (enabled=1)         -- normal fleet operation
 #   2) local file  <root>\ops\guard-rules.json         -- no DB, rules shipped with the installer
 #   3) commander   http://<中枢>:19387/rules           -- no DB and no local rules: ask 青鸟
 #
@@ -16,6 +16,14 @@
 #   regex_absent_in_files  definition=dir, param=regex, optional -Mask (default *.json)
 #   endpoint_ok         definition=URL, expect JSON ok=true; if param looks like a CIDR, additionally
 #                       require a firewall rule for the listen port scoped to that CIDR
+# ---------------- SECTION-2 CRITERION (2026-10-30, [TERMINAL-AT-20261030]) ----------------
+# Conventions section 2, written here so the executor and the acceptor cannot drift:
+#   acceptor success = delivered_at IS NOT NULL AND terminal_at IS NULL AND last_error IS NULL
+#   queue settled    = terminal_at IS NOT NULL   (state column, added 2026-10-30)
+#   legacy settled   = last_error LIKE 'terminal:%'  (rows written before 2026-10-30; the log says
+#                      "legacy_terminal" when this branch is what settles a row)
+# Rule #9 in dbo.guard_rules is the executable form of the queue half; it now reads terminal_at.
+# -----------------------------------------------------------------------------------------
 param(
     [string]$ConfigPath = 'C:\dsh-mem\dsh-mem.config.json',
     [string]$RulesFile = '',
@@ -33,6 +41,7 @@ $opsDir = Join-Path (Split-Path $ConfigPath -Parent) 'ops'
 if (-not $RulesFile) { $RulesFile = Join-Path $opsDir 'guard-rules.json' }
 
 $results = New-Object System.Collections.Generic.List[object]
+$policyCount = 0   # T21: 说明类(policy)规则单列计数，不计入 failed
 function Add-Result([string]$name, [string]$category, [string]$severity, [bool]$ok, [string]$detail) {
     $results.Add([pscustomobject]@{ name = $name; category = $category; severity = $severity; ok = $ok; detail = $detail })
 }
@@ -220,6 +229,12 @@ foreach ($r in $rules) {
                 }
                 Add-Result $name $cat $sev $ok $detail
             }
+            'policy' {
+                # T21 (2026-10-26): 说明类/要求类规则 —— 不做自动校验，判 PASS 并单列计数；
+                # detail 前缀必须能被 grep 成 'policy:'（落表时也要保留这个前缀）
+                $policyCount++
+                Add-Result $name $cat 'info' $true ('policy: 说明类规则，不自动校验（definition=' + [string]$r.definition + ')')
+            }
             default { Add-Result $name $cat $sev $false ('unsupported rule_type: ' + [string]$r.rule_type) }
         }
     } catch {
@@ -230,27 +245,58 @@ foreach ($r in $rules) {
 # ---------------- report ----------------
 $failCount = @($results | Where-Object { -not $_.ok -and $_.severity -eq 'fail' }).Count
 $warnCount = @($results | Where-Object { -not $_.ok -and $_.severity -eq 'warn' }).Count
+# T50-COUNT-CLOSURE (2026-10-26): 第三态必须能被表达，且每次运行必须自证计数闭合。
+#   旧口径：total=81 / passed=79 / failed=0 但 detail 里有 2 条 WARN ⇒ 79+0≠81，差额无处归属，
+#   而且旧 passed 把 policy(info) 也算进去了（等于把"无自动校验"当成"通过"）。
+#   新口径：passed=严格通过（ok 且非 info）；warn/policy/skipped 各自单列；
+#   闭合等式：total = passed + failed + warn + policy + skipped  ⇒ 差额写进 unaccounted 并判 FAIL。
+$skipCount = @($results | Where-Object { $_.severity -eq 'skip' }).Count
+$okStrictCount = @($results | Where-Object { $_.ok -and $_.severity -ne 'info' }).Count
+$closureSum = $okStrictCount + $failCount + $warnCount + $policyCount + $skipCount
+$unaccounted = $results.Count - $closureSum
+# T50 测试钩子（生产永不设置）：模拟"有规则没有归属"的第三态，验证断言会红
+if ($env:DSH_GUARD_RULES_TEST_UNACCOUNTED) { $unaccounted += [int]$env:DSH_GUARD_RULES_TEST_UNACCOUNTED }
+if ($env:DSH_GUARD_RULES_TEST_UNACCOUNTED) { Write-Output ('[info] T50 selftest: forced unaccounted=' + $unaccounted) }
+$closureOk = ($unaccounted -eq 0)
+$closureLine = 'rules_closure: total=' + $results.Count + ' passed=' + $okStrictCount + ' failed=' + $failCount + ' warn=' + $warnCount + ' policy=' + $policyCount + ' skipped=' + $skipCount + ' unaccounted=' + $unaccounted + ' closed=' + $closureOk + ' equation=total=passed+failed+warn+policy+skipped (T50-COUNT-CLOSURE)'
+Write-Output $closureLine
+if (-not $closureOk) { Write-Output ('[FAIL] rules_closure: unaccounted=' + $unaccounted + ' rule(s) have no bucket -- counts do not close') }
 if (-not $Quiet) {
-    foreach ($x in $results) {
-        Write-Output (($(if ($x.ok) { '[PASS]' } elseif ($x.severity -eq 'warn') { '[WARN]' } else { '[FAIL]' })) + ' ' + $x.name + '  ' + $x.detail)
+    function Get-State($r) {
+        if ($r.severity -eq 'info') { return 'policy' }
+        if ($r.ok) { return 'ok' }
+        if ($r.severity -eq 'warn') { return 'WARN' }
+        return 'FAIL'
     }
-    Write-Output ('rules: total=' + $results.Count + ' failed=' + $failCount + ' warn=' + $warnCount + ' source=' + $srcName + ' ver=' + $rulesVer)
+    foreach ($x in $results) {
+        $st = Get-State $x
+        $tagOut = if ($st -eq 'ok') { 'PASS' } else { $st }
+        Write-Output ('[' + $tagOut + '] ' + $x.name + '  ' + $x.detail)
+    }
+    Write-Output ('rules: total=' + $results.Count + ' failed=' + $failCount + ' warn=' + $warnCount + ' policy=' + $policyCount + ' source=' + $srcName + ' ver=' + $rulesVer)
 }
 
 # ---------------- record ----------------
 if (-not $NoRecord -and $cn) {
     try {
         $ins = $cn.CreateCommand()
-        $ins.CommandText = "INSERT INTO dbo.guard_rule_runs (rules_ver, total, passed, failed, detail, machine) VALUES (@v,@t,@p,@f,@d,@m)"
+        $closureNote = $(if ($closureOk) { 'closure_ok' } else { 'CLOSURE-FAIL unaccounted=' + $unaccounted })
+        $ins.CommandText = "INSERT INTO dbo.guard_rule_runs (rules_ver, total, passed, failed, detail, machine, warn, policy, skipped, unaccounted, closure_ok, passed_strict) VALUES (@v,@t,@p,@f,@d,@m,@w,@po,@sk,@ua,@co,@ps)"
         $null = $ins.Parameters.AddWithValue('@v', $rulesVer)
         $null = $ins.Parameters.AddWithValue('@t', $results.Count)
         $null = $ins.Parameters.AddWithValue('@p', (@($results | Where-Object { $_.ok }).Count))
         $null = $ins.Parameters.AddWithValue('@f', $failCount)
-        $null = $ins.Parameters.AddWithValue('@d', (($results | ForEach-Object { ($(if ($_.ok) { 'ok' } else { 'FAIL' })) + ':' + $_.name + ' | ' + $_.detail }) -join ' ;; '))
+        $null = $ins.Parameters.AddWithValue('@w', $warnCount)
+        $null = $ins.Parameters.AddWithValue('@po', $policyCount)
+        $null = $ins.Parameters.AddWithValue('@sk', $skipCount)
+        $null = $ins.Parameters.AddWithValue('@ua', $unaccounted)
+        $null = $ins.Parameters.AddWithValue('@co', $closureOk)
+        $null = $ins.Parameters.AddWithValue('@ps', $okStrictCount)
+        $null = $ins.Parameters.AddWithValue('@d', ((($results | ForEach-Object { '{0}:{1} | {2}' -f (Get-State $_), $_.name, $_.detail }) -join ' ;; ') + $(if ($closureOk) { '' } else { ' ;; ' + $closureNote })))
         $null = $ins.Parameters.AddWithValue('@m', $env:COMPUTERNAME)
         $null = $ins.ExecuteNonQuery()
     } catch { }
 }
 if ($cn) { $cn.Close() }
-if ($failCount -gt 0) { exit 3 }
+if ($failCount -gt 0 -or -not $closureOk) { exit 1 }
 exit 0
