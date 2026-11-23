@@ -71,6 +71,8 @@ param(
   [string]$Subject = $env:COMPUTERNAME,
   [string]$Kind = 'fact',
   [int]$Confidence = 80,
+  [int]$Valence = -1,      # 情绪价 0-10（0=负面 5=中性 10=正面；-1=未提供→NULL）
+  [string]$Situation = '', # 当时的处境/感受（空=未提供）
   [int]$Limit = 20,
   [int]$Context = 2,
   [int]$ReplicaMessages = 3000,
@@ -152,7 +154,7 @@ if (-not $cfg.node -or -not (Test-Path -LiteralPath $cfg.node)) {
 Add-Type -AssemblyName System.Data
 
 $script:Db          = $cfg.database
-$script:CsBase      = "Server=$($cfg.server);User Id=$($cfg.user);Password=$($cfg.password);TrustServerCertificate=True;Connect Timeout=20"
+$script:CsBase      = "Server=$($cfg.server);User Id=$($cfg.user);Password=$($cfg.password);Encrypt=False;TrustServerCertificate=True;Connect Timeout=20"
 $script:StatePath   = Join-Path $Root 'dsh-mem-state.json'
 $script:ReplicaPath = Join-Path $Root 'dsh-mem-replica.json'
 $script:ReplicaError = ''
@@ -161,16 +163,22 @@ if ($cfg.redact) { $script:RedactList = @($cfg.redact) }
 $script:State       = if (Test-Path -LiteralPath $script:StatePath) {
                         try { Read-TextFile $script:StatePath | ConvertFrom-Json } catch { [pscustomobject]@{} }
                       } else { [pscustomobject]@{} }
+# [INCREMENTAL-20261118] 每个 session 文件"上次成功解压到的字节偏移"（增量 sync 的断点）。
+# 独立文件：dsh-mem-state.json 是 sync 结果状态（251 条 key），偏移是技术缓存，分开存。
+$script:OffsetPath  = Join-Path $Root 'dsh-mem-offsets.json'
+$script:Offsets     = if (Test-Path -LiteralPath $script:OffsetPath) {
+                        try { Read-TextFile $script:OffsetPath | ConvertFrom-Json } catch { [pscustomobject]@{} }
+                      } else { [pscustomobject]@{} }
 
 function New-Cn([string]$db) {
-  $cn = New-Object System.Data.SqlClient.SqlConnection ("Server=$($cfg.server);Database=$db;User Id=$($cfg.user);Password=$($cfg.password);TrustServerCertificate=True;Connect Timeout=20")
+  $cn = New-Object System.Data.SqlClient.SqlConnection ("Server=$($cfg.server);Database=$db;User Id=$($cfg.user);Password=$($cfg.password);Encrypt=False;TrustServerCertificate=True;Connect Timeout=20")
   $cn.Open()
   return $cn
 }
 
 function Test-DbAlive {
   try {
-    $cn = New-Object System.Data.SqlClient.SqlConnection ("Server=$($cfg.server);Database=$($script:Db);User Id=$($cfg.user);Password=$($cfg.password);TrustServerCertificate=True;Connect Timeout=3")
+    $cn = New-Object System.Data.SqlClient.SqlConnection ("Server=$($cfg.server);Database=$($script:Db);User Id=$($cfg.user);Password=$($cfg.password);Encrypt=False;TrustServerCertificate=True;Connect Timeout=3")
     $cn.Open(); $cn.Close(); return $true
   } catch { return $false }
 }
@@ -329,6 +337,11 @@ function Save-State {
   try { [System.IO.File]::WriteAllText($script:StatePath, ($script:State | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding $false)) } catch { }
 }
 
+# [INCREMENTAL-20261118] 保存增量断点，与 Save-State 同样的写法。
+function Save-Offsets {
+  try { [System.IO.File]::WriteAllText($script:OffsetPath, ($script:Offsets | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding $false)) } catch { }
+}
+
 function Invoke-Sync {
   param([string]$SessionFile)
 
@@ -348,9 +361,25 @@ function Invoke-Sync {
     }
   }
 
+  # [INCREMENTAL-20261118] 增量断点：append-only 日志只解压新增帧。
+  # 条件：非 Force、有历史断点、文件比断点大（仍在 append）。
+  # 文件变小（被压缩/重写）→ 自动走全量，全量末尾会重置断点。
+  $offKey = 'off_' + $SessionFile
+  $lastOffset = [long]0
+  try { $lastOffset = [long]$script:Offsets.$offKey } catch { $lastOffset = [long]0 }
+  $useIncremental = (-not $Force) -and ($lastOffset -gt 0) -and ($fi.Length -gt $lastOffset)
+
   $tmp = Join-Path $env:TEMP ("dsh_sess_" + [guid]::NewGuid().ToString('N') + ".jsonl")
-  $meta = & $cfg.node $cfg.extractor $SessionFile $tmp | ConvertFrom-Json
-  Write-Host ("  extract: {0} frames (ok {1} / bad {2}), {3:N1} MB text" -f $meta.frames, $meta.okFrames, $meta.badFrames, ($meta.outputBytes / 1MB))
+# [TEMP-SWEEP-20261106] 清理 >1 天的历史 dsh_sess_*.jsonl（L512 正常删除；中途失败会残留，实测 2 周累积 6.87GB）
+try { Get-ChildItem $env:TEMP -Filter 'dsh_sess_*.jsonl' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } | Remove-Item -Force -ErrorAction SilentlyContinue } catch { }
+  if ($useIncremental) {
+    $meta = & $cfg.node $cfg.extractor $SessionFile $tmp --from $lastOffset | ConvertFrom-Json
+    Write-Host ("  extract (incremental from {0}): {1} frames (ok {2} / bad {3}), {4:N1} KB text" -f $lastOffset, $meta.processedFrames, $meta.okFrames, $meta.badFrames, ($meta.outputBytes / 1KB))
+  } else {
+    $meta = & $cfg.node $cfg.extractor $SessionFile $tmp | ConvertFrom-Json
+    Write-Host ("  extract: {0} frames (ok {1} / bad {2}), {3:N1} MB text" -f $meta.frames, $meta.okFrames, $meta.badFrames, ($meta.outputBytes / 1MB))
+  }
+  $newOffset = [long]$meta.endOffset
 
   $events = ConvertFrom-Jsonl -Path $tmp
   $header = $events | Where-Object { $_.type -eq 'session' } | Select-Object -First 1
@@ -455,7 +484,34 @@ function Invoke-Sync {
     $bcIn.Close()
 
     $cmdW = $cnW.CreateCommand()
-    $cmdW.CommandText = @"
+    # [FULLSYNC-TIMEOUT-20261119] upsert 的 SqlCommand 默认 30 秒超时。
+    # 全量对账对大会话（132MB / 4 万行）是长事务，实测会抛 "Execution Timeout Expired"；
+    # fail closed 保证不写坏数据，但该 session 当轮对账白做（11-19 全量对账 244 个文件里失败 1 个就是这个）。
+    # 与 Invoke-Exec 的 300 秒对齐。
+    $cmdW.CommandTimeout = 300
+    if ($useIncremental) {
+      # [INCREMENTAL-20261118] 增量 upsert：只 UPDATE 补齐 + INSERT 新增，不跑 archive/dropped/delete。
+      # 前提：session 日志 append-only，旧 seq 不会消失。文件变小会自动回退全量对账。
+      $cmdW.CommandText = @"
+DECLARE @ins int, @upd int;
+UPDATE m SET m.turn = i.turn, m.role = i.role, m.text = i.text, m.created_at = i.created_at
+FROM dbo.messages m JOIN #incoming i ON i.seq = m.seq
+WHERE m.session_id = @sid
+  AND (CONVERT(varchar(32), HASHBYTES('MD5', m.text), 2) <> CONVERT(varchar(32), HASHBYTES('MD5', i.text), 2)
+       OR ISNULL(m.role, '') <> ISNULL(i.role, '') OR ISNULL(m.turn, -1) <> ISNULL(i.turn, -1));
+SET @upd = @@ROWCOUNT;
+INSERT INTO dbo.messages (session_id, seq, turn, role, text, created_at)
+SELECT @sid, i.seq, i.turn, i.role, i.text, i.created_at FROM #incoming i
+WHERE NOT EXISTS (SELECT 1 FROM dbo.messages m WHERE m.session_id = @sid AND m.seq = i.seq);
+SET @ins = @@ROWCOUNT;
+SELECT @ins AS inserted, @upd AS updated;
+"@
+      [void]$cmdW.Parameters.AddWithValue('@sid', $sid)
+      $rdW = $cmdW.ExecuteReader()
+      if ($rdW.Read()) { $updIns = [int]$rdW.GetValue(0); $updUpd = [int]$rdW.GetValue(1) }
+      $rdW.Close()
+    } else {
+      $cmdW.CommandText = @"
 DECLARE @dropped int, @changed int, @ins int, @upd int, @del int;
 SELECT @dropped = COUNT(*) FROM dbo.messages m LEFT JOIN #incoming i ON i.seq = m.seq
   WHERE m.session_id = @sid AND i.seq IS NULL
@@ -497,11 +553,22 @@ SELECT @dropped AS dropped, @changed AS changed, @ins AS inserted, @upd AS updat
       $updIns = [int]$rdW.GetValue(2); $updUpd = [int]$rdW.GetValue(3); $updRem = [int]$rdW.GetValue(4)
     }
     $rdW.Close()
+    }
   } catch {
     # fail closed: no archive/write -> the session's rows are left untouched and the log stays on disk
     throw ("phase 1+2 write failed, refusing to touch this session's rows: " + $_.Exception.Message)
   } finally { $cnW.Close() }
 
+  if ($useIncremental) {
+    # [INCREMENTAL-20261118] 增量模式不覆盖 cwd/title（新帧里没有 session header），只刷新 last_seen_at。
+    [void](Invoke-Exec -Sql @"
+MERGE dbo.sessions AS t
+USING (SELECT @sid AS session_id, @machine AS machine) AS s
+   ON t.session_id = s.session_id
+WHEN MATCHED THEN UPDATE SET machine=s.machine, last_seen_at=SYSUTCDATETIME()
+WHEN NOT MATCHED THEN INSERT (session_id, machine, cwd, title, event_count) VALUES (s.session_id, s.machine, '', '', 0);
+"@ -Params @{ '@sid' = $sid; '@machine' = $env:COMPUTERNAME })
+  } else {
   [void](Invoke-Exec -Sql @"
 MERGE dbo.sessions AS t
 USING (SELECT @sid AS session_id, @machine AS machine, @cwd AS cwd, @title AS title) AS s
@@ -509,11 +576,15 @@ USING (SELECT @sid AS session_id, @machine AS machine, @cwd AS cwd, @title AS ti
 WHEN MATCHED THEN UPDATE SET machine=s.machine, cwd=s.cwd, title=s.title, last_seen_at=SYSUTCDATETIME(), event_count=@cnt
 WHEN NOT MATCHED THEN INSERT (session_id, machine, cwd, title, event_count) VALUES (s.session_id, s.machine, s.cwd, s.title, @cnt);
 "@ -Params @{ '@sid' = $sid; '@machine' = $env:COMPUTERNAME; '@cwd' = $cwd; '@title' = $sessTitle; '@cnt' = $events.Count })
+  }
   Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
 
   # remember what we imported so the next run can skip it
   $script:State | Add-Member -NotePropertyName $SessionFile -NotePropertyValue $key -Force
   Save-State
+  # [INCREMENTAL-20261118] 记录本次解压到的断点（增量或全量都更新）。
+  $script:Offsets | Add-Member -NotePropertyName $offKey -NotePropertyValue $newOffset -Force
+  Save-Offsets
 
   Write-Host ("  session : $sid")
   Write-Host ("  title   : $sessTitle")
@@ -713,7 +784,7 @@ function New-EmbedBody {
     $h = @{ model = $Model; prompt = $Text }
     if ($KeepAlive) { $h['keep_alive'] = $KeepAlive }
   }
-  return ($h | ConvertTo-Json -Compress)
+  return ($h | ConvertTo-Json -Compress -Depth 5)
 }
 
 function Get-EmbeddingVector {
@@ -1006,11 +1077,12 @@ if ([string]$Kind -eq 'secret') {
     Assert-Length 'source_session' ([string]$Target) $script:ColLimits.source_session
     # Read back what actually landed: INSERT ... OUTPUT gives the row id and the stored
     # length in the same round trip, so a silent failure or a truncation cannot hide.
+    # [VALENCE-CONTEXT-20261119] 情绪价 + 情境上下文：valence(0-10) 与 context 列随 save 落库、检索时一并召回。
     $res = Invoke-Rows -Sql @"
-INSERT INTO dbo.memories (scope, subject, kind, title, body, tags, source_session, confidence)
+INSERT INTO dbo.memories (scope, subject, kind, title, body, tags, source_session, confidence, valence, context)
 OUTPUT INSERTED.id AS id, LEN(INSERTED.title) AS tlen, LEN(INSERTED.body) AS blen
-VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf)
-"@ -Params @{ '@scope' = $Scope; '@subject' = $Subject; '@kind' = $Kind; '@title' = $Title; '@body' = $Body; '@tags' = $Tags; '@src' = $Target; '@conf' = $Confidence }
+VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf, CASE WHEN @valence = -1 THEN NULL ELSE @valence END, NULLIF(@context, ''))
+"@ -Params @{ '@scope' = $Scope; '@subject' = $Subject; '@kind' = $Kind; '@title' = $Title; '@body' = $Body; '@tags' = $Tags; '@src' = $Target; '@conf' = $Confidence; '@valence' = $Valence; '@context' = $Situation }
     if (@($res).Count -ne 1) { throw "save wrote no row (INSERT returned nothing)" }
     $newId = [int64]$res[0].id
     $gotB  = [int]$res[0].blen
@@ -1047,8 +1119,29 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf)
     $whereLike = ($likeClauses -join ' AND ')
     if (Test-DbAlive) {
       Write-Host ("== memories matching '$Target' ==")
-      $sqlMem = "SELECT TOP (@n) id, created_at, scope, subject, kind, title, tags, body FROM dbo.memories WHERE $whereLike ORDER BY CASE WHEN kind = 'checkpoint' THEN 1 ELSE 0 END, CASE WHEN title LIKE @q0 THEN 0 ELSE 1 END, updated_at DESC"
+      # [FTS-SEARCH-20261120] 全文检索优先：memories 的 title/body/tags 已有 lcid=2052 简体中文全文索引，
+      # FREETEXTTABLE 排名召回（实测 记忆系统 FTS 1228 条 vs LIKE 79 条、断连 431 vs 8），
+      # 解决"换词/部分重叠搜不到"；0 命中或索引不可用则回退原 LIKE（行为不回退）。
+      $sqlMem = "SELECT TOP (@n) id, created_at, scope, subject, kind, title, tags, body FROM dbo.memories WHERE $whereLike ORDER BY CASE WHEN kind = 'checkpoint' THEN 1 ELSE 0 END, access_count DESC, CASE WHEN title LIKE @q0 THEN 0 ELSE 1 END, updated_at DESC"
       $m = Invoke-Rows -Sql $sqlMem -Params $likeParams
+      if (@($m).Count -eq 0) {
+        $m = Invoke-Rows -Sql "SELECT TOP (@n) m.id, m.created_at, m.scope, m.subject, m.kind, m.title, m.tags, m.body FROM FREETEXTTABLE(dbo.memories, (title, body, tags), @fts) ct JOIN dbo.memories m ON m.id = ct.[KEY] ORDER BY CASE WHEN m.kind = 'checkpoint' THEN 1 ELSE 0 END, ct.RANK DESC, m.access_count DESC, m.updated_at DESC" -Params @{ '@n' = $Limit; '@fts' = $Target }
+      }
+      # [ACCESS-REINFORCE-20261119] 访问加固：对最终展示的记忆 +1、记访问时间（检索命中即"被想起"）。
+      $arIds = @($m | ForEach-Object { [int64]$_.id })
+      if ($arIds.Count -gt 0) { $null = Invoke-Exec -Sql ("UPDATE dbo.memories SET access_count = access_count + 1, last_injected_at = SYSUTCDATETIME() WHERE id IN (" + ($arIds -join ',') + ")") }
+      # [CO-OCCUR-20261119] 共现互链（回忆重建）：同一次查询同时命中的记忆，记一条共现边、权重+1。
+      # 依据调研（REALM 检索反馈再巩固 + 共现记忆互链成簇）：让"常一起被想起"的记忆抱团，供未来集体召回。
+      $hitIds = @($m | ForEach-Object { [int64]$_.id })
+      if ($hitIds.Count -ge 2) {
+        $top = @($hitIds | Select-Object -First 5)
+        for ($i = 0; $i -lt $top.Count; $i++) {
+          for ($j = $i + 1; $j -lt $top.Count; $j++) {
+            $lo = [Math]::Min($top[$i], $top[$j]); $hi = [Math]::Max($top[$i], $top[$j])
+            $null = Invoke-Exec -Sql "UPDATE dbo.memory_refs SET weight = weight + 1 WHERE memory_id = @lo AND cited_id = @hi AND relation = 'cooccurs'; IF @@ROWCOUNT = 0 INSERT INTO dbo.memory_refs (memory_id, cited_id, relation, weight) VALUES (@lo, @hi, 'cooccurs', 1);" -Params @{ '@lo' = $lo; '@hi' = $hi }
+          }
+        }
+      }
       if (@($m).Count -eq 0) { Write-Host "  (none)" }
       foreach ($r in @($m)) {
         Write-Host ("  [{0}] {1} {2}/{3} {4}  {5}" -f $r.id, $r.created_at.ToLocalTime().ToString('MM-dd HH:mm'), $r.scope, $r.subject, $r.kind, $r.title)
@@ -1070,9 +1163,33 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf)
       Write-Host ""
       Write-Host ("== messages matching '$Target' ==")
       $msgWhere = (@($terms | ForEach-Object -Begin { $i = 0 } -Process { $i++; '(text LIKE @q' + ($i - 1) + ')' }) -join ' AND ')
-      $g = Invoke-Rows -Sql "SELECT TOP (@n) session_id, seq, role, created_at, LEFT(text, 200) AS snippet FROM dbo.messages WHERE $msgWhere ORDER BY created_at DESC" -Params $likeParams
+      # [FTS-2STAGE-20261123] messages 分支改两阶段：先用全文索引取候选（约 34ms），再在内存做子串精确过滤。
+      #   根因（2026-11-23 实测）：dbo.messages 600MB/120,778 行，低频词 text LIKE 全表扫 12-30s，SQL 超时后静默返回 0 行。
+      #   为什么保留精确过滤：FTS 是分词匹配，可能把词拆开误命中，必须再用子串过滤（AND 语义对每个词都过一遍）。
+      #   为什么仍保留 LIKE 全表兜底：FTS 可能取不到候选（纯符号/生僻串），那时退回原行为，语义与原版一致。
+      $msgCand = @()
+      $g = @()
+      try {
+        $msgCandLimit = [int]([Math]::Max($Limit * 4, 40))
+        $msgCand = Invoke-Rows -Sql "SELECT TOP (@n) m.id, m.session_id, m.seq, m.role, m.created_at, m.text FROM FREETEXTTABLE(dbo.messages, (text), @fts) ft JOIN dbo.messages m ON m.id = ft.[KEY] ORDER BY ft.RANK DESC, m.created_at DESC" -Params @{ '@n' = $msgCandLimit; '@fts' = $Target }
+        $msgKept = @()
+        foreach ($cr in @($msgCand)) {
+          $tx = [string]$cr.text
+          $hitAll = $true
+          foreach ($t in @($terms)) { if ($tx.IndexOf($t, [StringComparison]::OrdinalIgnoreCase) -lt 0) { $hitAll = $false; break } }
+          if (-not $hitAll) { continue }
+          $snip = $(if ($tx.Length -gt 200) { $tx.Substring(0, 200) } else { $tx })
+          $msgKept += [pscustomobject]@{ session_id = $cr.session_id; seq = $cr.seq; role = $cr.role; created_at = $cr.created_at; snippet = $snip }
+          if ($msgKept.Count -ge $Limit) { break }
+        }
+        $g = @($msgKept)
+      } catch { $g = @() }
+      # 兜底：仅当 FTS 候选集为空（分词取不到）时才退回原来那次 LIKE 全表查（可能慢，但与原语义一致）
+      if (@($msgCand).Count -eq 0) {
+        $g = Invoke-Rows -Sql "SELECT TOP (@n) session_id, seq, role, created_at, LEFT(text, 200) AS snippet FROM dbo.messages WHERE $msgWhere ORDER BY created_at DESC" -Params $likeParams
+      }
       if (@($g).Count -eq 0) { Write-Host "  (none)" }
-      foreach ($r in @($g)) { Write-Host ("  {0} #{1} {2}: {3}" -f $r.created_at.ToLocalTime().ToString('MM-dd HH:mm'), $r.seq, $r.role, ($r.snippet -replace '\s+', ' ')) }
+      foreach ($r in @($g)) { Write-Host ("  {0} #{1} {2}: {3}" -f ([datetime]$r.created_at).ToLocalTime().ToString('MM-dd HH:mm'), $r.seq, $r.role, ([string]$r.snippet -replace '\s+', ' ')) }
     } else {
       $rep = Get-Replica
       if (-not $rep) { Write-NoReplica; return }
@@ -1205,7 +1322,7 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf)
       # ★ Keyed by CONTENT HASH, never by the vector's item_id: that id may already be stale
       #   (sync re-inserts rows with new ids) while the resolver fetched the CURRENT row.
       #   Joining the two by id printed stale ids plus "(not fetched)" for perfectly good
-      #   hits -- exactly the defect 17 and 18 measured ([153] / [155]).
+      #   hits -- exactly the defect measured on two cluster nodes ([153] / [155]).
       $msgSnipByHash  = @{}
       $msgCurIdByHash = @{}
       foreach ($m in @($hitMsg)) {
@@ -1503,6 +1620,18 @@ WHERE e.model = @model AND r.rn > 1
     }
   }
 
+  'mood' {
+    # [MOOD-20261119] 情绪状态变量：读 4 个内部状态 + 按静默时间漂移（SQL DATEDIFF，UTC 统一无时区歧义）。
+    # 依据调研（Serenity 持续情绪动力学）：情绪是"会漂移的内部状态"，改变行为而非语气。
+    # 漂移率：boredom 每小时 +0.012，energy 每小时 -0.006（静默涨无聊、耗能量）。
+    if (Test-DbAlive) {
+      $null = Invoke-Exec -Sql "UPDATE dbo.agent_state SET value = CASE state_name WHEN 'boredom' THEN CASE WHEN value + 0.0002 * DATEDIFF(MINUTE, updated_at, SYSUTCDATETIME()) > 1.0 THEN 1.0 ELSE value + 0.0002 * DATEDIFF(MINUTE, updated_at, SYSUTCDATETIME()) END WHEN 'energy' THEN CASE WHEN value - 0.0001 * DATEDIFF(MINUTE, updated_at, SYSUTCDATETIME()) < 0.1 THEN 0.1 ELSE value - 0.0001 * DATEDIFF(MINUTE, updated_at, SYSUTCDATETIME()) END ELSE value END, updated_at = SYSUTCDATETIME()"
+      $st = Invoke-Rows -Sql "SELECT state_name, value FROM dbo.agent_state ORDER BY state_name"
+      Write-Host "== 当前情绪状态 =="
+      foreach ($s in @($st)) { Write-Host ("  " + $s.state_name.PadRight(14) + " " + [Math]::Round([double]$s.value, 3)) }
+    } else { Write-NoReplica }
+  }
+
   'recent' {
     if (Test-DbAlive) {
       $m = Invoke-Rows -Sql "SELECT TOP (@n) id, created_at, scope, subject, kind, title FROM dbo.memories ORDER BY id DESC" -Params @{ '@n' = $Limit }
@@ -1757,7 +1886,10 @@ SELECT (SELECT COUNT(*) FROM dbo.sessions) AS sessions,
     if (-not (Test-DbAlive)) { Write-Host "  database unreachable - replica NOT refreshed (existing copy left untouched)"; return }
     $mem  = Invoke-Rows -Sql "SELECT id, scope, subject, kind, title, body, tags, confidence, CONVERT(varchar(33), created_at, 126) + 'Z' AS created_at, CONVERT(varchar(33), updated_at, 126) + 'Z' AS updated_at FROM dbo.memories ORDER BY id"
     $msg  = Invoke-Rows -Sql "SELECT TOP (@n) m.id, m.session_id, s.machine, m.seq, m.role, CONVERT(varchar(33), m.created_at, 126) + 'Z' AS created_at, LEFT(m.text, 800) AS text FROM dbo.messages m LEFT JOIN dbo.sessions s ON s.session_id = m.session_id ORDER BY m.id DESC" -Params @{ '@n' = $ReplicaMessages }
-    $sess = Invoke-Rows -Sql "SELECT session_id, machine, title, event_count, CONVERT(varchar(33), last_seen_at, 126) + 'Z' AS last_seen_at FROM dbo.sessions ORDER BY last_seen_at DESC"
+    # 2026-10-27: replica 的 last_seen_at 改为「真实活动时刻」= MAX(sessions.last_seen_at, MAX(messages.created_at))。
+    #   原实现只读 dbo.sessions.last_seen_at，而该列由 sync 的 MERGE 写、sync 又跳过已导入会话 ⇒ 热会话结构性冻结，
+    #   导致注入里的「各机最近活动」把活的机器显示成"几天前"。真值另存 meta_last_seen_at，保留可对照。
+    $sess = Invoke-Rows -Sql "SELECT s.session_id, s.machine, s.title, s.event_count, CONVERT(varchar(33), CASE WHEN m.mx IS NOT NULL AND m.mx > s.last_seen_at THEN m.mx ELSE s.last_seen_at END, 126) + 'Z' AS last_seen_at FROM dbo.sessions s LEFT JOIN (SELECT session_id, MAX(created_at) AS mx FROM dbo.messages GROUP BY session_id) m ON m.session_id = s.session_id ORDER BY ISNULL(m.mx, s.last_seen_at) DESC"
     $rep = [pscustomobject]@{
       generatedAt = (Get-Date).ToUniversalTime().ToString('o')
       server      = $cfg.server
