@@ -47,7 +47,7 @@ import os, { tmpdir } from 'node:os'   // 2026-10-25 修：之前只取了 tmpdi
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-// R1-MARKER 2026-10-26: state cards 3->2 + pinned-card support (autonomous change, reviewed)
+// R1-MARKER 2026-10-26: state cards 3->2 + pinned-card support (user-approved autonomous change)
 export const VERSION = '0.5.4'
 export const name = 'dsh-memory-bridge'
 export const inject = ['systemPrompt']
@@ -181,7 +181,8 @@ export function apply(ctx, config) {
   // 2026-10-24 C4：混合检索（本地嵌入 bge-m3 via 18 的 Ollama；失败自动退化为纯 IDF）
   const semanticOn    = config.semantic === false ? false : true
   const vectorPath    = config.vectorPath || 'C:\\dsh-mem\\mem-vectors.bin'
-  const ollamaUrl     = config.ollamaUrl || 'http://127.0.0.1:11434'
+  // [HYBRID-RECALL-20261123] [OPENSOURCE-20261124] 任务②：ollama 在 18（config.embed.baseURL=192.0.2.18:11434）；旧默认 127.0.0.1:11434（11 本机无 ollama）⇒ curl-fail ⇒ 向量分支永不生效、退化成纯 IDF。
+  const ollamaUrl     = config.ollamaUrl || (config.embed && config.embed.baseURL) || 'http://127.0.0.1:11434'
   const embedModel    = config.embedModel || 'bge-m3'
   // 2026-10-25 r8（18 指出）：`injector=0.5.0` 从 r1 到 r7 一直没变 ⇒ **不携带"哪个 build"的信息**。
   //   改为 injector=0.5.0-<本文件 sha16 前 8 位>，自证 build；任何探针必须能区分相邻版本。
@@ -234,6 +235,8 @@ export function apply(ctx, config) {
   const semVecWeight  = Number(config.semVecWeight || 0.45)
   const semMinFinal   = Number(config.semMinFinal || 0.32)
   const semBackoffMs  = Number(config.semanticBackoffMs || 600000) // 仅测试可用配置缩短（默认 10 分钟）
+  // [BACKOFF-SCOPE-20261123] 任务②修复（mem 34965）：semanticSkipUntil 必须模块级；旧值在 refresh 内每轮重建作用域重置为 0，backoff 失效（铁证：BACKOFF 每 60s 连击）
+  let semanticSkipUntil = 0
 
   // 2026-10-24 采纳 17/18 意见：maxChars 不能只 WARN —— 低于"保证下限"就拒启并把算式写进注入，
   //   因为 WARN 会被忽略，而截断是静默的（hints 就是这样丢的）。
@@ -410,19 +413,18 @@ export function apply(ctx, config) {
           return m
         } catch (e) { vecState.why = 'load-fail:' + String(e && e.message || e); return null }
       }
-      let semanticSkipUntil = 0
       function embedTopic (text) {
         if (!vecState.ok || !text) return null
         if (Date.now() < semanticSkipUntil) { vecState.why = 'backoff'; return null }
         try {
           const body = JSON.stringify({ model: embedModel, input: String(text).slice(0, 2000) })
           const t0 = Date.now()
-          const res = spawnSync('curl.exe', ['-s', '--max-time', '12', '-X', 'POST', ollamaUrl + '/api/embed',
+          const res = spawnSync('curl.exe', ['-s', '--max-time', '5', '-X', 'POST', ollamaUrl + '/api/embed',
             '-H', 'Content-Type: application/json', '--data-binary', body], { encoding: 'utf8', timeout: 15000, windowsHide: true })
           if (!res || res.status !== 0 || !res.stdout) {
             vecState.why = 'curl-fail'
             semanticSkipUntil = Date.now() + semBackoffMs
-            log('SEMANTIC-BACKOFF ' + Math.round(semBackoffMs / 1000) + 's after curl-fail')
+            log('SEMANTIC-BACKOFF ' + Math.round(semBackoffMs / 1000) + 's after curl-fail url=' + ollamaUrl + ' status=' + (res && res.status) + ' err=' + JSON.stringify(res && res.error ? String(res.error.message || res.error) : null) + ' stderr=' + JSON.stringify(res && res.stderr ? String(res.stderr).slice(0, 160) : ''))
             return null
           }
           const j = JSON.parse(res.stdout)
@@ -522,7 +524,12 @@ export function apply(ctx, config) {
           const kwList = Array.from(kws)
           if (kwList.length) {
             const pool = mems.filter(function (m) {
-              if (String(m.kind || '') === 'checkpoint' || String(m.kind || '') === 'evidence' || String(m.kind || '') === 'llm-call') return false
+              // [AUDIT-KIND-20261124] [OPENSOURCE-20261124] 审计条目（MEM-FIRST-VIOLATION）与会话压缩摘要不参与自动召回：
+//   它们数量大（126+121）、title 几乎模板填空 ⇒ 对任何通用词都能排进 top-4，实测注入头相关率仅 1/4。
+//   kind 是主判据；title 前缀是兜底（防止生产者漏改把 kind 写回 ops-note）。
+          const __kind = String(m.kind || '')
+          if (__kind === 'checkpoint' || __kind === 'evidence' || __kind === 'llm-call' || __kind === 'audit' || __kind === 'compaction-summary') return false
+          if (/^MEM-FIRST-VIOLATION\s/.test(String(m.title || ''))) return false
               if (String(m.status || 'current') === 'retired' || String(m.status || 'current') === 'archived') return false
               if (String(m.body || '').length > 200000) return false // 2026-10-24: 原来 >6000 直接跳过=静默丢失；只挡 20 万字符以上的极端情况
               return true
@@ -672,7 +679,14 @@ export function apply(ctx, config) {
                 }
                 const rest = skipped.concat(notChosen)
                 if (rest.length) { SECTIONS.shards.push(""); SECTIONS.shards.push("可用约定分片（未命中或超出上限，未注入；需要时读 " + conventionsDir + "）：" + rest.join("、")) }
-                log("INJECT-SHARDS injected=" + injected.length + " skipped=" + skipped.length)
+                // [SHARDS-NAMES-20261107] 把"实际注入了哪几片 / 因上限被挤掉哪几片"写进日志：
+                //   以前只有 injected=N skipped=M，排障时无法回答"这次到底注了哪三片"，只能靠猜
+                const injNames = injected.map(function (x) { return x.name })
+                const capDropped = notChosen.slice(0, 6)
+                log("INJECT-SHARDS injected=" + injected.length + " skipped=" + skipped.length +
+                  " cap=" + SHARD_CAP + " names=" + (injNames.join(",") || "-") +
+                  " cap_dropped=" + (capDropped.join(",") || "-") +
+                  " rest=" + rest.length)
               }
             }
           } catch (e) { log("INJECT-SHARDS-FAIL " + String(e && e.message || e)) }
@@ -720,7 +734,7 @@ export function apply(ctx, config) {
             } catch (e) { }
           }
           cards.sort(function (a, b) { return b.m - a.m })
-          // R1 2026-10-26: pin cards whose text matches config.statePinned (regex) so requirement cards never lose to recency
+          // R1 2026-10-26: pin cards whose text matches config.statePinned (regex) so user-requirement / life cards never lose to recency
           let pinned = []
           try {
             const pinRe = config.statePinned ? new RegExp(String(config.statePinned), 'i') : null

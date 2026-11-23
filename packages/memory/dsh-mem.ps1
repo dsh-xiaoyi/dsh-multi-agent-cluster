@@ -82,7 +82,8 @@ param(
   [switch]$Force,
   [switch]$SkipArchive,
   [string]$Session,
-  [long]$Seq = 0
+  [long]$Seq = 0,
+  [switch]$Smart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -494,14 +495,14 @@ try { Get-ChildItem $env:TEMP -Filter 'dsh_sess_*.jsonl' -File -ErrorAction Sile
       # 前提：session 日志 append-only，旧 seq 不会消失。文件变小会自动回退全量对账。
       $cmdW.CommandText = @"
 DECLARE @ins int, @upd int;
-UPDATE m SET m.turn = i.turn, m.role = i.role, m.text = i.text, m.created_at = i.created_at
+UPDATE m SET m.turn = i.turn, m.role = i.role, m.text = i.text, m.created_at = i.created_at, m.text_hash1200 = CONVERT(binary(16), HASHBYTES('MD5', LEFT(ISNULL(i.text,''),1200)))
 FROM dbo.messages m JOIN #incoming i ON i.seq = m.seq
 WHERE m.session_id = @sid
   AND (CONVERT(varchar(32), HASHBYTES('MD5', m.text), 2) <> CONVERT(varchar(32), HASHBYTES('MD5', i.text), 2)
        OR ISNULL(m.role, '') <> ISNULL(i.role, '') OR ISNULL(m.turn, -1) <> ISNULL(i.turn, -1));
 SET @upd = @@ROWCOUNT;
-INSERT INTO dbo.messages (session_id, seq, turn, role, text, created_at)
-SELECT @sid, i.seq, i.turn, i.role, i.text, i.created_at FROM #incoming i
+INSERT INTO dbo.messages (session_id, seq, turn, role, text, created_at, text_hash1200)
+SELECT @sid, i.seq, i.turn, i.role, i.text, i.created_at, CONVERT(binary(16), HASHBYTES('MD5', LEFT(ISNULL(i.text,''),1200))) FROM #incoming i
 WHERE NOT EXISTS (SELECT 1 FROM dbo.messages m WHERE m.session_id = @sid AND m.seq = i.seq);
 SET @ins = @@ROWCOUNT;
 SELECT @ins AS inserted, @upd AS updated;
@@ -528,14 +529,14 @@ WHERE m.session_id = @sid
        OR ISNULL(m.role, '') <> ISNULL(i.role, '') OR ISNULL(m.turn, -1) <> ISNULL(i.turn, -1))
   -- 2026-10-25 实时 spool 通道：刚由 spool 写入、但会话文件还没落盘到那一帧的行，不判 dropped
   AND NOT (i.seq IS NULL AND ISNULL(m.source, '') = 'spool' AND m.created_at > DATEADD(minute, -10, SYSUTCDATETIME()));
-UPDATE m SET m.turn = i.turn, m.role = i.role, m.text = i.text, m.created_at = i.created_at
+UPDATE m SET m.turn = i.turn, m.role = i.role, m.text = i.text, m.created_at = i.created_at, m.text_hash1200 = CONVERT(binary(16), HASHBYTES('MD5', LEFT(ISNULL(i.text,''),1200)))
 FROM dbo.messages m JOIN #incoming i ON i.seq = m.seq
 WHERE m.session_id = @sid
   AND (CONVERT(varchar(32), HASHBYTES('MD5', m.text), 2) <> CONVERT(varchar(32), HASHBYTES('MD5', i.text), 2)
        OR ISNULL(m.role, '') <> ISNULL(i.role, '') OR ISNULL(m.turn, -1) <> ISNULL(i.turn, -1));
 SET @upd = @@ROWCOUNT;
-INSERT INTO dbo.messages (session_id, seq, turn, role, text, created_at)
-SELECT @sid, i.seq, i.turn, i.role, i.text, i.created_at FROM #incoming i
+INSERT INTO dbo.messages (session_id, seq, turn, role, text, created_at, text_hash1200)
+SELECT @sid, i.seq, i.turn, i.role, i.text, i.created_at, CONVERT(binary(16), HASHBYTES('MD5', LEFT(ISNULL(i.text,''),1200))) FROM #incoming i
 WHERE NOT EXISTS (SELECT 1 FROM dbo.messages m WHERE m.session_id = @sid AND m.seq = i.seq);
 SET @ins = @@ROWCOUNT;
 DELETE m FROM dbo.messages m
@@ -632,15 +633,26 @@ function Get-MessagesByHash {
   # silently loses exactly the content written most recently (memory [146]).
   # Picks the newest row when the same content exists more than once.
   param([string[]]$Hashes, [int]$Chars, [int]$Limit)
+  # [TEXT-HASH1200-20261124] [OPENSOURCE-20261124] 自愈兜底：任何写入者漏填 text_hash1200 时，顺手补一小批（最多 500 行），
+  # 避免该列变 NULL 导致语义命中查不到。为什么需要：dbo.messages 有多个写入者
+  # （dsh-mem.ps1 / ops\spool-import.ps1 / 验证脚本），靠"记得改每一处"不可靠（实测回填后 NULL 仍在增长）。
+  # 注意：param() 必须是函数体第一条语句，本段必须在 param 之后。
+  try {
+    $null = Invoke-Exec -Sql "UPDATE TOP (500) dbo.messages SET text_hash1200 = CONVERT(binary(16), HASHBYTES('MD5', LEFT(ISNULL(text,''),1200))) WHERE text_hash1200 IS NULL"
+  } catch { }
   $hs = @($Hashes | Where-Object { $_ })
   if ($hs.Count -eq 0) { return @() }
   $lits = @($hs | Select-Object -First ([Math]::Max(1, $Limit)) | ForEach-Object { '0x' + $_ })
   $sql = @"
 ;WITH h AS (
-  SELECT CONVERT(binary(16), HASHBYTES('MD5', LEFT(ISNULL(text, ''), @chars))) AS text_hash, MAX(id) AS id
+  -- [TEXT-HASH1200-20261124] [OPENSOURCE-20261124] 改用持久化列 text_hash1200（非唯一索引），取代 HASHBYTES 全表扫。
+  --   根因（2026-11-24 实测）：HASHBYTES('MD5',LEFT(text,1200)) IN (20 字面量) 无法走索引，
+  --   对 605.9MB / 122,861 行的 dbo.messages 做了约 20 遍全表扫 = 31,675ms，占 recall 42s 的 75%。
+  --   改后实测 5ms（6,335 倍）。列由写入路径维护（dsh-mem.ps1 的 INSERT/UPDATE + spool-import.ps1）。
+  SELECT text_hash1200 AS text_hash, MAX(id) AS id
   FROM dbo.messages
-  WHERE CONVERT(binary(16), HASHBYTES('MD5', LEFT(ISNULL(text, ''), @chars))) IN ($($lits -join ','))
-  GROUP BY CONVERT(binary(16), HASHBYTES('MD5', LEFT(ISNULL(text, ''), @chars)))
+  WHERE text_hash1200 IN ($($lits -join ','))
+  GROUP BY text_hash1200
 )
 SELECT m.id, m.session_id, s.machine, s.title, m.seq, m.role,
        CONVERT(varchar(33), m.created_at, 126) + 'Z' AS created_at,
@@ -847,6 +859,80 @@ function Get-EmbeddingBatch {
   }
 }
 
+function Read-VectorBuffer {
+  # [VECBUFFER-20261124] (alias of GET-SEMRECALL-FAST-20261124) 单遍直读：DataReader -> 预分配连续 byte[]，绕过 Invoke-Rows 的逐行物化。
+  # 为什么（2026-11-24 实测，3,656 行 / 14.3MB）：Invoke-Rows 每行建 ordered hashtable + pscustomobject
+  #   = 1,450ms；之后还要从对象里取 vec 再 BlockCopy 一次 = 858ms => 同一批字节搬两次、中间包两个对象。
+  #   单遍直填 = 204ms（省约 2.1 秒），bench 已验证 flat[0] 解出的 float 与 SQL 原始 vec 逐位相同。
+  # 语义与旧路径一致：维度不符的行同样跳过（旧代码是 b.Length -ne dim*4 -> continue）。
+  param([string]$Sql, [hashtable]$Params = @{}, [string]$Db, [int]$Cap)
+  $cn = New-Cn $Db
+  try {
+    $cmd = $cn.CreateCommand(); $cmd.CommandText = $Sql; $cmd.CommandTimeout = 120
+    foreach ($k in $Params.Keys) { [void]$cmd.Parameters.AddWithValue($k, $Params[$k]) }
+    $rd = $cmd.ExecuteReader()
+    $oT = $rd.GetOrdinal('item_type'); $oI = $rd.GetOrdinal('item_id')
+    $oV = $rd.GetOrdinal('vec');       $oH = $rd.GetOrdinal('text_hash')
+    $dim = 0; $flat = $null; $off = 0; $dropped = 0
+    $types  = New-Object System.Collections.ArrayList
+    $ids    = New-Object System.Collections.ArrayList
+    $hashes = New-Object System.Collections.ArrayList
+    while ($rd.Read()) {
+      if ($rd.IsDBNull($oV)) { $dropped++; continue }
+      $sb = $rd.GetSqlBytes($oV)
+      if (-not $sb -or $sb.Length -lt 4) { $dropped++; continue }
+      if ($dim -eq 0) {
+        $dim = [int]($sb.Length / 4)
+        $flat = New-Object byte[] ($dim * 4 * [Math]::Max(1, $Cap))
+      }
+      if ($sb.Length -ne ($dim * 4)) { $dropped++; continue }
+      if (($off + $sb.Length) -gt $flat.Length) {
+        $big = New-Object byte[] ([Math]::Max($off + $sb.Length, $flat.Length * 2))
+        [System.Buffer]::BlockCopy($flat, 0, $big, 0, $off)
+        $flat = $big
+      }
+      $null = $sb.Stream.Read($flat, $off, $sb.Length)
+      $off += $sb.Length
+      [void]$types.Add([string]$rd.GetValue($oT))
+      [void]$ids.Add([int64]$rd.GetValue($oI))
+      $hb = $rd.GetValue($oH)
+      if ($hb -is [byte[]] -and $hb.Length -gt 0) { [void]$hashes.Add((([System.BitConverter]::ToString([byte[]]$hb)) -replace '-', '')) } else { [void]$hashes.Add('') }
+    }
+    $rd.Close()
+    return [pscustomobject]@{ flat = $flat; bytes = $off; dim = $dim; count = $ids.Count; types = $types.ToArray(); ids = $ids.ToArray(); hashes = $hashes.ToArray(); dropped = $dropped }
+  } finally { $cn.Close() }
+}
+
+function Update-MoodDrift {
+  # [MOOD-ENABLE-20261124] [OPENSOURCE-20261124] 情绪状态漂移 + 交互反馈。
+  # 为什么抽成函数：原来只有两个触发点（mood 命令 / ops\dsh-reflect.ps1 L83），而 reflect 的漂移
+  #   排在 LLM 调用之后 ⇒ LLM 一失败就永远走不到（实测 agent_state 冻结 23 小时）。
+  #   现挂到 search/recall 开头（纯本地、零外部依赖），每次检索漂移一次。
+  # [MOOD-CALIB-20261124] 静默：boredom +0.002/分钟（原 0.0002 太慢，1 小时才能抵 3 次检索）、energy -0.0001/分钟（地板 0.1）
+  # [MOOD-CALIB-20261124] 交互：boredom -0.02（原 -0.05 太快，12 次检索就归零）、地板 0.10（原 0.0）
+  # [MOOD-CALIB-20261124] 交互：boredom -0.02 / curiosity +0.02 / energy +0.02 / social_drive -0.01
+  # [MOOD-CALIB-20261124] 第二轮：curiosity 与 energy 各加静默回落 -0.001/分钟（原来只涨不落，会单向钉在 1.0）
+  #   ⇒ 四维现在都是"交互反馈 + 静默漂移"双向，不再单向钉死边界
+  # [MOOD-CALIB-20261124] 第三轮：social_drive 加静默回升 +0.001/分钟（原来只降不升，约 6 次集群检索后永久钉在 0）
+  param([int]$Activity = 0)
+  try {
+    $mins = "DATEDIFF(MINUTE, updated_at, SYSUTCDATETIME())"
+    $sql = "UPDATE dbo.agent_state SET value = CASE state_name " +
+      "WHEN 'boredom' THEN CASE WHEN value + 0.002 * $mins - 0.02 * $Activity > 1.0 THEN 1.0 " +
+      "WHEN value + 0.002 * $mins - 0.02 * $Activity < 0.10 THEN 0.10 " +
+      "ELSE value + 0.002 * $mins - 0.02 * $Activity END " +
+      "WHEN 'energy' THEN CASE WHEN value - 0.0001 * $mins - 0.001 * $mins + 0.02 * $Activity > 1.0 THEN 1.0 " +
+      "WHEN value - 0.0001 * $mins - 0.001 * $mins + 0.02 * $Activity < 0.0 THEN 0.0 " +
+      "ELSE value - 0.0001 * $mins - 0.001 * $mins + 0.02 * $Activity END " +
+      "WHEN 'curiosity' THEN CASE WHEN value - 0.001 * $mins + 0.02 * $Activity > 1.0 THEN 1.0 " +
+      "WHEN value - 0.001 * $mins + 0.02 * $Activity < 0.0 THEN 0.0 ELSE value - 0.001 * $mins + 0.02 * $Activity END " +
+      "WHEN 'social_drive' THEN CASE WHEN value + 0.001 * $mins - 0.01 * $Activity < 0.0 THEN 0.0 " +
+      "WHEN value + 0.001 * $mins - 0.01 * $Activity > 1.0 THEN 1.0 ELSE value + 0.001 * $mins - 0.01 * $Activity END " +
+      "ELSE value END, updated_at = SYSUTCDATETIME()"
+    $null = Invoke-Exec -Sql $sql
+  } catch { }
+}
+
 function Get-SemanticRecall {
   # Returns @{ ok = $true; model; hits = @(@{item_type;item_id;score}) }
   #     or  @{ ok = $false; reason = '...' }   -- never throws, never silent.
@@ -862,37 +948,42 @@ function Get-SemanticRecall {
     # text_hash travels with each vector so hits can be resolved by CONTENT later: sync
     # re-inserts messages with new ids, so an id-keyed lookup loses exactly the newest
     # content (memory [146]).
-    $rowsRaw = Invoke-Rows -Sql "SELECT item_type, item_id, vec, text_hash FROM dbo.embeddings WHERE model = @m" -Params @{ '@m' = $e.model }
-    $rows = @($rowsRaw)
-    # Pack all vectors into one buffer, then score them in one compiled call (see
-    # Get-VectorScores for why the PowerShell loop is not good enough here).
-    $dim = 0
-    $packed = New-Object System.Collections.ArrayList
-    $chunks = New-Object System.Collections.ArrayList
-    foreach ($r in $rows) {
-      $b = [byte[]]$r.vec
-      if (-not $b -or $b.Length -lt 4) { continue }
-      if ($dim -eq 0) { $dim = [int]($b.Length / 4) }
-      if ($b.Length -ne ($dim * 4)) { continue }
-      [void]$chunks.Add($b); [void]$packed.Add($r)
+    # [VEC-CANDIDATE-20261123] [OPENSOURCE-20261124] 候选集拉取（mem 34946）：memory 全量（3.6k 约 15MB），message 只拉 FTS 候选（500 约 2MB），
+    #   替代 430MB 全量（106k message 向量）。代价：纯语义（零字面重叠）message 召回收窄，由 -Smart 改写补。
+    # [GET-SEMRECALL-FAST-20261124] [OPENSOURCE-20261124] 取数改单遍直读：省 Invoke-Rows 逐行物化 + 二次打包（实测 2,308ms -> 204ms）。
+    $memCntRaw = Invoke-Rows -Sql "SELECT COUNT(*) AS n FROM dbo.embeddings WHERE model = @m AND item_type = 'memory'" -Params @{ '@m' = $e.model }
+    $memCap = [int]$memCntRaw[0].n
+    $bufA = Read-VectorBuffer -Sql "SELECT item_type, item_id, vec, text_hash FROM dbo.embeddings WHERE model = @m AND item_type = 'memory'" -Params @{ '@m' = $e.model } -Db $script:Db -Cap $memCap
+    $msgIds = @()
+    try {
+      $cand = Invoke-Rows -Sql "SELECT TOP (@n) e.item_id FROM FREETEXTTABLE(dbo.messages, (text), @q) ft JOIN dbo.embeddings e ON e.item_id = ft.[KEY] AND e.item_type = 'message' AND e.model = @m ORDER BY ft.RANK DESC" -Params @{ '@n' = 500; '@q' = $Query; '@m' = $e.model }
+      $msgIds = @($cand | ForEach-Object { [int64]$_.item_id })
+    } catch { $msgIds = @() }
+    $bufB = [pscustomobject]@{ flat = (New-Object byte[] 0); bytes = 0; dim = 0; count = 0; types = @(); ids = @(); hashes = @(); dropped = 0 }
+    if ($msgIds.Count -gt 0) {
+      $bufB = Read-VectorBuffer -Sql ("SELECT item_type, item_id, vec, text_hash FROM dbo.embeddings WHERE model = @m AND item_type = 'message' AND item_id IN (" + ($msgIds -join ',') + ")") -Params @{ '@m' = $e.model } -Db $script:Db -Cap $msgIds.Count
     }
-    if ($packed.Count -eq 0) { return [pscustomobject]@{ ok = $false; reason = 'no usable stored vector for this model' } }
-    if ($qv.Length -ne $dim) { return [pscustomobject]@{ ok = $false; reason = ('query dimension ' + $qv.Length + ' != stored dimension ' + $dim + ' (wrong model/dim in the embed block?)') } }
-    $flat = New-Object byte[] ($dim * 4 * $packed.Count)
-    for ($k = 0; $k -lt $packed.Count; $k++) { $bb = $chunks[$k]; [System.Buffer]::BlockCopy($bb, 0, $flat, ($k * $dim * 4), $bb.Length) }
-    $scores = Get-VectorScores -Flat $flat -Dim $dim -Count $packed.Count -Query $qv
+    $dim = if ($bufA.dim -gt 0) { $bufA.dim } elseif ($bufB.dim -gt 0) { $bufB.dim } else { 0 }
+    $totalBytes = [int]$bufA.bytes + [int]$bufB.bytes
+    $packedCount = [int]$bufA.count + [int]$bufB.count
+    if ($packedCount -eq 0 -or $dim -le 0 -or $totalBytes -eq 0) { return [pscustomobject]@{ ok = $false; reason = 'no usable stored vector for this model' } }
+    $flat = New-Object byte[] $totalBytes
+    if ($bufA.bytes -gt 0) { [System.Buffer]::BlockCopy($bufA.flat, 0, $flat, 0, [int]$bufA.bytes) }
+    if ($bufB.bytes -gt 0) { [System.Buffer]::BlockCopy($bufB.flat, 0, $flat, [int]$bufA.bytes, [int]$bufB.bytes) }
+    $packedTypes  = @($bufA.types)  + @($bufB.types)
+    $packedIds    = @($bufA.ids)    + @($bufB.ids)
+    $packedHashes = @($bufA.hashes) + @($bufB.hashes)
+    if ($qv.Length -ne $dim) { return [pscustomobject]@{ ok = $false; reason = ('query dimension ' + $qv.Length + ' != stored dimension ' + $dim + ' (wrong model/dim in the embed block)') } }
+    $scores = Get-VectorScores -Flat $flat -Dim $dim -Count $packedCount -Query $qv
     $scored = New-Object System.Collections.ArrayList
-    for ($k = 0; $k -lt $packed.Count; $k++) {
-      $hb = [byte[]]$packed[$k].text_hash
-      $hx = ''
-      if ($hb -and $hb.Length -gt 0) { $hx = ([System.BitConverter]::ToString($hb)) -replace '-', '' }
-      [void]$scored.Add([pscustomobject]@{ item_type = [string]$packed[$k].item_type; item_id = [int64]$packed[$k].item_id; score = [double]$scores[$k]; hash = $hx })
+    for ($k = 0; $k -lt $packedCount; $k++) {
+      [void]$scored.Add([pscustomobject]@{ item_type = [string]$packedTypes[$k]; item_id = [int64]$packedIds[$k]; score = [double]$scores[$k]; hash = [string]$packedHashes[$k] })
     }
     # NOTE: do NOT name this $top -- PowerShell variable names are case-insensitive,
     # so $top IS the [int]$Top parameter, and assigning an array to a type-constrained
     # variable throws "Cannot convert System.Object[] to System.Int32" (memory [118]).
     $ranked = @($scored | Sort-Object -Property score -Descending | Select-Object -First $Top)
-    return [pscustomobject]@{ ok = $true; model = $e.model; hits = $ranked; scored = $packed.Count }
+    return [pscustomobject]@{ ok = $true; model = $e.model; hits = $ranked; scored = $packedCount }
   } catch {
     # Covers both backend failures and bugs on this path, so the wording stays neutral
     # and the line number is included: a mislabelled "backend error" hides code faults.
@@ -1013,6 +1104,51 @@ function Write-RecallContextBlock {
 # every writing command refreshes this machine's roster row
 if ($Command -match '^(sync|replica|save|backup)$') { Register-Host }
 
+function Invoke-SmartRewrite {
+  # [SMART-REWRITE-20261123] [OPENSOURCE-20261124] 口语<->术语改写：主 deepseek-chat，备火山方舟 deepseek-v4-1-flash（密钥 mem 34806）
+  param([string]$Text)
+  try {
+    $csx = "Server=$($cfg.server);Database=$($cfg.database);User Id=$($cfg.user);Password=$($cfg.password);Encrypt=False;TrustServerCertificate=True;Connect Timeout=15"
+    $cnx = New-Object System.Data.SqlClient.SqlConnection $csx
+    $cnx.Open()
+    $cmdx = $cnx.CreateCommand()
+    $cmdx.CommandText = "SELECT name, secret FROM dbo.credentials WHERE is_active=1 AND name IN ('deepseek-api-key-2026-10','volc-ark-doubao-v2');"
+    $rdx = $cmdx.ExecuteReader()
+    $keyDs = ''; $keyVolc = ''
+    while ($rdx.Read()) {
+      if ($rdx['name'] -eq 'deepseek-api-key-2026-10') { $keyDs = [string]$rdx['secret'] }
+      elseif ($rdx['name'] -eq 'volc-ark-doubao-v2') { $keyVolc = [string]$rdx['secret'] }
+    }
+    $rdx.Close(); $cnx.Close()
+    if (-not $keyDs -and -not $keyVolc) { Write-Host '  [SMART] FAIL: 主备密钥都读不到'; return $null }
+    $prompt = '把下面的口语问题改写成 3~6 个检索关键词（术语化、同义词展开、空格分隔，只输出关键词本身，不要解释、不要标点）：' + $Text
+    $bodyObj = @{ model = 'deepseek-chat'; messages = @(@{ role = 'user'; content = $prompt }); temperature = 0.2 } | ConvertTo-Json -Depth 6
+    $bytes = [Text.Encoding]::UTF8.GetBytes($bodyObj)
+    $reply = $null; $used = ''
+    try {
+      $resp = Invoke-WebRequest -Uri 'https://api.deepseek.com/chat/completions' -Method Post -ContentType 'application/json; charset=utf-8' -Headers @{ Authorization = ('Bearer ' + $keyDs) } -Body $bytes -TimeoutSec 60 -UseBasicParsing
+      $obj = ([Text.Encoding]::UTF8.GetString($resp.RawContentStream.ToArray())) | ConvertFrom-Json
+      $reply = [string]$obj.choices[0].message.content; $used = 'deepseek'
+    } catch {
+      Write-Host ('  [SMART] deepseek 失败: ' + $_.Exception.Message + ' -> 切火山')
+      try {
+        $body2 = @{ model = 'deepseek-v4-1-flash'; messages = @(@{ role = 'user'; content = $prompt }); temperature = 0.2 } | ConvertTo-Json -Depth 6
+        $b2 = [Text.Encoding]::UTF8.GetBytes($body2)
+        $resp2 = Invoke-WebRequest -Uri 'https://ark.cn-beijing.volces.com/api/v3/chat/completions' -Method Post -ContentType 'application/json; charset=utf-8' -Headers @{ Authorization = ('Bearer ' + $keyVolc) } -Body $b2 -TimeoutSec 60 -UseBasicParsing
+        $obj2 = ([Text.Encoding]::UTF8.GetString($resp2.RawContentStream.ToArray())) | ConvertFrom-Json
+        $reply = [string]$obj2.choices[0].message.content; $used = 'volc-v2'
+      } catch {
+        Write-Host ('  [SMART] FAIL: 主备都失败: ' + $_.Exception.Message); return $null
+      }
+    }
+    $reply = ([string]$reply).Trim()
+    if (-not $reply) { return $null }
+    Write-Host ('  [SMART] ' + $used + ' 改写: ' + $Text + '  ->  ' + $reply)
+    return $reply
+  } catch {
+    Write-Host ('  [SMART] FAIL: ' + $_.Exception.Message); return $null
+  }
+}
 switch ($Command.ToLower()) {
 
   'sync' {
@@ -1077,7 +1213,6 @@ if ([string]$Kind -eq 'secret') {
     Assert-Length 'source_session' ([string]$Target) $script:ColLimits.source_session
     # Read back what actually landed: INSERT ... OUTPUT gives the row id and the stored
     # length in the same round trip, so a silent failure or a truncation cannot hide.
-    # [VALENCE-CONTEXT-20261119] 情绪价 + 情境上下文：valence(0-10) 与 context 列随 save 落库、检索时一并召回。
     $res = Invoke-Rows -Sql @"
 INSERT INTO dbo.memories (scope, subject, kind, title, body, tags, source_session, confidence, valence, context)
 OUTPUT INSERTED.id AS id, LEN(INSERTED.title) AS tlen, LEN(INSERTED.body) AS blen
@@ -1103,12 +1238,18 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf, CASE WHEN @v
   }
 
   'search' {
+    Update-MoodDrift -Activity 1   # [MOOD-ENABLE-20261124] [OPENSOURCE-20261124] 检索即有活动 ⇒ 4 维漂移+反馈
     if (-not $Target) { throw "search requires a keyword" }
+    $effectiveTarget = $Target
+    if ($Smart) {
+      $rw = Invoke-SmartRewrite -Text $Target
+      if ($rw) { $effectiveTarget = $rw }
+    }
     # 2026-10-24 B4：① LIKE 通配符转义（原来 `search 备份_` 里 _ 当任意字符，440 条假命中）
     #              ② 多词按 AND 拆开（原来 `"共享盘 SMB"` 整串一个 LIKE，零命中）
     #              ③ 排序：checkpoint 垫底 → 标题命中优先 → 更新时间
-    $terms = @($Target -split '\s+' | Where-Object { $_ })
-    if ($terms.Count -eq 0) { $terms = @($Target) }
+    $terms = @($effectiveTarget -split '\s+' | Where-Object { $_ })
+    if ($terms.Count -eq 0) { $terms = @($effectiveTarget) }
     $likeParams = @{ '@n' = $Limit }
     $likeClauses = @()
     for ($ti = 0; $ti -lt $terms.Count; $ti++) {
@@ -1122,10 +1263,10 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf, CASE WHEN @v
       # [FTS-SEARCH-20261120] 全文检索优先：memories 的 title/body/tags 已有 lcid=2052 简体中文全文索引，
       # FREETEXTTABLE 排名召回（实测 记忆系统 FTS 1228 条 vs LIKE 79 条、断连 431 vs 8），
       # 解决"换词/部分重叠搜不到"；0 命中或索引不可用则回退原 LIKE（行为不回退）。
-      $sqlMem = "SELECT TOP (@n) id, created_at, scope, subject, kind, title, tags, body FROM dbo.memories WHERE $whereLike ORDER BY CASE WHEN kind = 'checkpoint' THEN 1 ELSE 0 END, access_count DESC, CASE WHEN title LIKE @q0 THEN 0 ELSE 1 END, updated_at DESC"
+      $sqlMem = "SELECT TOP (@n) id, created_at, scope, subject, kind, title, tags, body FROM dbo.memories WHERE $whereLike ORDER BY /* [AUDIT-KIND-20261124] [OPENSOURCE-20261124] 审计/压缩摘要在 search 里垫底（不隐藏，仍可查） */ CASE WHEN kind IN ('checkpoint','audit','compaction-summary') THEN 1 ELSE 0 END, access_count DESC, CASE WHEN title LIKE @q0 THEN 0 ELSE 1 END, updated_at DESC"
       $m = Invoke-Rows -Sql $sqlMem -Params $likeParams
       if (@($m).Count -eq 0) {
-        $m = Invoke-Rows -Sql "SELECT TOP (@n) m.id, m.created_at, m.scope, m.subject, m.kind, m.title, m.tags, m.body FROM FREETEXTTABLE(dbo.memories, (title, body, tags), @fts) ct JOIN dbo.memories m ON m.id = ct.[KEY] ORDER BY CASE WHEN m.kind = 'checkpoint' THEN 1 ELSE 0 END, ct.RANK DESC, m.access_count DESC, m.updated_at DESC" -Params @{ '@n' = $Limit; '@fts' = $Target }
+        $m = Invoke-Rows -Sql "SELECT TOP (@n) m.id, m.created_at, m.scope, m.subject, m.kind, m.title, m.tags, m.body FROM FREETEXTTABLE(dbo.memories, (title, body, tags), @fts) ct JOIN dbo.memories m ON m.id = ct.[KEY] ORDER BY CASE WHEN m.kind = 'checkpoint' THEN 1 ELSE 0 END, ct.RANK DESC, m.access_count DESC, m.updated_at DESC" -Params @{ '@n' = $Limit; '@fts' = $effectiveTarget }
       }
       # [ACCESS-REINFORCE-20261119] 访问加固：对最终展示的记忆 +1、记访问时间（检索命中即"被想起"）。
       $arIds = @($m | ForEach-Object { [int64]$_.id })
@@ -1171,7 +1312,7 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf, CASE WHEN @v
       $g = @()
       try {
         $msgCandLimit = [int]([Math]::Max($Limit * 4, 40))
-        $msgCand = Invoke-Rows -Sql "SELECT TOP (@n) m.id, m.session_id, m.seq, m.role, m.created_at, m.text FROM FREETEXTTABLE(dbo.messages, (text), @fts) ft JOIN dbo.messages m ON m.id = ft.[KEY] ORDER BY ft.RANK DESC, m.created_at DESC" -Params @{ '@n' = $msgCandLimit; '@fts' = $Target }
+        $msgCand = Invoke-Rows -Sql "SELECT TOP (@n) m.id, m.session_id, m.seq, m.role, m.created_at, m.text FROM FREETEXTTABLE(dbo.messages, (text), @fts) ft JOIN dbo.messages m ON m.id = ft.[KEY] ORDER BY ft.RANK DESC, m.created_at DESC" -Params @{ '@n' = $msgCandLimit; '@fts' = $effectiveTarget }
         $msgKept = @()
         foreach ($cr in @($msgCand)) {
           $tx = [string]$cr.text
@@ -1224,6 +1365,7 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf, CASE WHEN @v
   }
 
   'recall' {
+    Update-MoodDrift -Activity 1   # [MOOD-ENABLE-20261124] [OPENSOURCE-20261124] 检索即有活动 ⇒ 4 维漂移+反馈
     # ---- D plan: context-aware recall --------------------------------------------
     # Preferred backend is semantic search (F plan).  It is used only when the embed
     # config, the vector table and the endpoint all work; otherwise this DEGRADES to
@@ -1322,7 +1464,7 @@ VALUES (@scope, @subject, @kind, @title, @body, @tags, @src, @conf, CASE WHEN @v
       # ★ Keyed by CONTENT HASH, never by the vector's item_id: that id may already be stale
       #   (sync re-inserts rows with new ids) while the resolver fetched the CURRENT row.
       #   Joining the two by id printed stale ids plus "(not fetched)" for perfectly good
-      #   hits -- exactly the defect measured on two cluster nodes ([153] / [155]).
+      #   hits -- exactly the defect two cluster nodes measured ([153] / [155]).
       $msgSnipByHash  = @{}
       $msgCurIdByHash = @{}
       foreach ($m in @($hitMsg)) {

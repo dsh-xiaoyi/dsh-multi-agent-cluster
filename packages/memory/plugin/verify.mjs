@@ -9,6 +9,7 @@
 //      所以这里【用原始毫秒独立算一遍期望值】，专门抓这类时区偏移。
 //
 // 用法: node verify.mjs        退出码 0=通过 1=没注册context 2=注入为空 3=捕获没挂上 4=捕获没触发 5=活动段异常
+//   2026-11-07 追加（[VERIFY-CACHE-20261107] 注入缓存命中）: 18=缓存文件不可用/不新鲜 19=日志无 source=cache 命中或取不到日志 20=日志 rev/got 与缓存不一致
 //
 // v0.4.0 新增断言:
 //   D. 必须挂上 llm/stream 记账钩子，且假流 3 个 chunk 必须【原样直通】
@@ -21,7 +22,7 @@
 //   C. ★ 最新一行的 HH:MM 必须等于"用 /Date(毫秒) 独立算出的 UTC 时分"
 //      —— 这条能直接抓住时区偏移（正是我踩的那个坑）
 
-import { existsSync, readFileSync, writeFileSync, rmSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, rmSync, readdirSync, statSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
@@ -278,9 +279,133 @@ if (actIdx < 0) {
   if (okRounds !== 20) { console.error('FAIL(17): 连续 20 轮 expect==got 失败: ' + okRounds + '/20'); process.exit(17) }
   console.log('rules 20-round = 20/20 expect==got (expect=' + core.expect + ')')
 }
+
+// ---------------- [VERIFY-CACHE-20261107] 注入缓存命中断言（昨晚的注入提速改动）----------------
+// 缺口: index.mjs 加了 spool\core-rules.json 缓存 —— 存在且 ok===true 且 age<=10min 就直读缓存，
+//   否则重新 spawn 生成器并【自预热】写回缓存；每次注入会往 inject.log 写一行
+//     ... INJECT-RULES-CACHE source=cache rev=9 got=12 ...  或  source=spawn ...
+//   原来的 verify 完全不知道有这回事 ⇒ 缓存坏掉（永远 spawn / 永远读过期缓存）没人会红。
+// 本段三条:
+//   A. 缓存文件存在 + ok===true + rev 是数字 + 新鲜度 <= 15min      —— 不存在也 FAIL（不是 SKIP）
+//   B. 日志最近 50 条 INJECT-RULES-CACHE 里 source=cache 命中数      —— 为 0 ⇒ 提速没生效，FAIL
+//   C. 同一批日志的 rev=/got= 与缓存文件一致                        —— 不一致 ⇒ 缓存过期没更新，FAIL
+// ★ 必须放在下面 eventHandler 提前退出之前，否则永远不执行。
+let cacheSummary = 'cache=未检查'
+{
+  const cachePath = 'C:\\dsh-mem\\spool\\core-rules.json'
+  const logPath = 'C:\\dsh-mem\\logs\\inject.log'
+  // 注入器写的 generated_at 是 UTC 但不带后缀（实测 mtime 14:54:03 = generated_at 06:54:03），
+  // 且是 .NET 的 7 位小数 —— JS 的 Date.parse 只吃 3 位，这里两种都归一化。
+  const parseStamp = (v) => {
+    if (typeof v !== 'string' || !v.trim()) return NaN
+    let s = v.trim().replace(/(\.\d{3})\d+/, '$1')
+    if (!/(Z|[+-]\d{2}:?\d{2})$/.test(s)) s += 'Z'
+    return Date.parse(s)
+  }
+
+  // ---- A. 缓存文件存在且新鲜（不存在 ⇒ FAIL，不是 SKIP）----
+  let cacheRaw = ''
+  let cacheStat = null
+  try { cacheStat = statSync(cachePath); cacheRaw = readFileSync(cachePath, 'utf8') } catch (e) {
+    console.error('FAIL(18): [VERIFY-CACHE-20261107] 缓存文件取不到: ' + cachePath + ' (' + ((e && e.code) || e) + ') —— 不存在=FAIL，不能跳过当通过')
+    process.exit(18)
+  }
+  if (cacheRaw.charCodeAt(0) === 0xFEFF) cacheRaw = cacheRaw.slice(1)
+  let cache = null
+  try { cache = JSON.parse(cacheRaw) } catch (e) {
+    console.error('FAIL(18): [VERIFY-CACHE-20261107] 缓存不是合法 JSON: ' + cachePath + ' (' + e.message + ')')
+    process.exit(18)
+  }
+  const ageMtimeMs = Date.now() - cacheStat.mtimeMs
+  const genMs = parseStamp(cache.generated_at || cache.writtenAt || cache.written_at)
+  const ageGenMs = isNaN(genMs) ? NaN : Date.now() - genMs
+  // 取两者较大者 = 最保守（任何一方说过期就按过期判）
+  const ageMs = isNaN(ageGenMs) ? ageMtimeMs : Math.max(ageMtimeMs, ageGenMs)
+  const ageMin = ageMs / 60000
+  const cacheRev = cache.rev
+  const cacheGot = Number(cache.got)
+  console.log('[VERIFY-CACHE-20261107] A cache=' + cachePath + ' bytes=' + cacheStat.size +
+    ' ok=' + JSON.stringify(cache.ok) + ' rev=' + JSON.stringify(cacheRev) + ' got=' + cache.got + ' expect=' + cache.expect +
+    ' age=' + ageMin.toFixed(2) + 'min (mtime=' + (ageMtimeMs / 60000).toFixed(2) + 'min, generated_at=' +
+    (isNaN(ageGenMs) ? 'UNPARSED' : (ageGenMs / 60000).toFixed(2) + 'min') + ')')
+  if (cache.ok !== true) {
+    console.error('FAIL(18): [VERIFY-CACHE-20261107] 缓存 ok=' + JSON.stringify(cache.ok) + '（要求 true）⇒ 缓存不可用，每次注入都会重新 spawn')
+    process.exit(18)
+  }
+  if (typeof cacheRev !== 'number' || !Number.isFinite(cacheRev)) {
+    console.error('FAIL(18): [VERIFY-CACHE-20261107] 缓存 rev=' + JSON.stringify(cacheRev) + ' 不是数字')
+    process.exit(18)
+  }
+  if (ageMs > 15 * 60000) {
+    console.error('FAIL(18): [VERIFY-CACHE-20261107] 缓存不新鲜 age=' + ageMin.toFixed(2) + 'min > 15.00min (rev=' + cacheRev + ' bytes=' + cacheStat.size + ') ⇒ 注入器没把生成结果回写缓存')
+    process.exit(18)
+  }
+  if (cacheGot !== Number(cache.expect)) {
+    console.log('WARN [VERIFY-CACHE-20261107] 缓存 got=' + cacheGot + ' != expect=' + cache.expect + '（不在此判 FAIL，交给上面 20 轮断言）')
+  }
+
+  // ---- B. 日志最近 50 条注入必须有 source=cache 命中（0 条 ⇒ 提速没生效）----
+  let logRaw = ''
+  try { logRaw = readFileSync(logPath, 'utf8') } catch (e) {
+    console.error('FAIL(19): [VERIFY-CACHE-20261107] 取不到日志，无法判断: ' + logPath + ' (' + ((e && e.code) || e) + ')')
+    process.exit(19)
+  }
+  const cacheLines = logRaw.split(/\r?\n/).filter((l) => l.indexOf('INJECT-RULES-CACHE') >= 0)
+  if (cacheLines.length === 0) {
+    console.error('FAIL(19): [VERIFY-CACHE-20261107] 取不到日志，无法判断: ' + logPath + ' 里一条 INJECT-RULES-CACHE 都没有（读了 ' + logRaw.length + ' chars）')
+    process.exit(19)
+  }
+  const recent = cacheLines.slice(-50)
+  const nCache = recent.filter((l) => /source=cache/.test(l)).length
+  const nSpawn = recent.filter((l) => /source=spawn/.test(l)).length
+  const nNoSrc = recent.filter((l) => !/source=\w+/.test(l)).length
+  const lastLine = recent[recent.length - 1]
+  console.log('[VERIFY-CACHE-20261107] B log=' + logPath + ' total=' + cacheLines.length + ' recent=' + recent.length +
+    ' sourceCache=' + nCache + ' sourceSpawn=' + nSpawn + ' noSource=' + nNoSrc)
+  console.log('[VERIFY-CACHE-20261107] B newest=' + lastLine.trim())
+  if (nNoSrc === recent.length) {
+    console.error('FAIL(19): [VERIFY-CACHE-20261107] 最近 ' + recent.length + ' 条 INJECT-RULES-CACHE 全都没有 source= 字段 ⇒ 取不到可判的记录')
+    process.exit(19)
+  }
+  if (recent.length < 10) {
+    console.error('FAIL(19): [VERIFY-CACHE-20261107] 日志样本不足 recent=' + recent.length + ' 条 < 10 ⇒ 无法判断缓存是否在命中')
+    process.exit(19)
+  }
+  if (nCache === 0) {
+    console.error('FAIL(19): [VERIFY-CACHE-20261107] 最近 ' + recent.length + ' 条里 source=cache=0 / source=spawn=' + nSpawn + ' ⇒ 缓存从没命中过，注入提速没生效')
+    process.exit(19)
+  }
+
+  // ---- C. 日志的 rev/got 必须与缓存文件一致（不一致 ⇒ 缓存过期没更新）----
+  const lSource = (/\bsource=(\w+)/.exec(lastLine) || [])[1] || '?'
+  const lRev = (/\brev=(\d+)/.exec(lastLine) || [])[1]
+  const lGot = (/\bgot=(\d+)/.exec(lastLine) || [])[1]
+  const revMismatch = recent.filter((l) => { const m = /\brev=(\d+)/.exec(l); return m && Number(m[1]) !== cacheRev }).length
+  const gotMismatch = recent.filter((l) => { const m = /\bgot=(\d+)/.exec(l); return m && Number(m[1]) !== cacheGot }).length
+  console.log('[VERIFY-CACHE-20261107] C newest source=' + lSource + ' rev=' + lRev + ' got=' + lGot +
+    ' | cache rev=' + cacheRev + ' got=' + cacheGot +
+    ' | recent revMismatch=' + revMismatch + '/' + recent.length + ' gotMismatch=' + gotMismatch + '/' + recent.length)
+  if (lRev === undefined || lGot === undefined) {
+    console.error('FAIL(20): [VERIFY-CACHE-20261107] 最新一条日志缺 rev=/got=，无法对账: ' + lastLine.trim())
+    process.exit(20)
+  }
+  if (Number(lRev) !== cacheRev) {
+    console.error('FAIL(20): [VERIFY-CACHE-20261107] rev 不一致: 日志最新 rev=' + lRev + ' vs 缓存 rev=' + cacheRev +
+      '（日志里 ' + revMismatch + '/' + recent.length + ' 条对不上）⇒ 缓存过期没更新')
+    process.exit(20)
+  }
+  if (Number(lGot) !== cacheGot) {
+    console.error('FAIL(20): [VERIFY-CACHE-20261107] got 不一致: 日志最新 got=' + lGot + ' vs 缓存 got=' + cacheGot +
+      '（日志里 ' + gotMismatch + '/' + recent.length + ' 条对不上）')
+    process.exit(20)
+  }
+  cacheSummary = 'cache ok=rev' + cacheRev + '/got' + cacheGot + ' age=' + ageMin.toFixed(2) + 'min hit=' + nCache + '/' + recent.length
+  console.log('[VERIFY-CACHE-20261107] cache assert= OK ' + cacheSummary)
+}
+
 if (typeof eventHandler !== 'function') {
   console.log('eventHandler= 未挂上（v0.5.4+ 自动捕获改走 spool：C:\\dsh-mem\\spool\\hot.jsonl，这是新架构下的正常结果；要判实时性请测 hot.jsonl 是否增长）')
-  console.log('RESULT: PASS (注入部分)')
+  console.log('RESULT: PASS (注入部分 · ' + cacheSummary + ')')
   process.exit(0)
 }
 
