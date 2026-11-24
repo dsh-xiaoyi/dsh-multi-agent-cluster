@@ -178,10 +178,10 @@ export function apply(ctx, config) {
   const injectLogPath = config.injectLogPath || 'C:\\dsh-mem\\logs\\inject.log'
   // T17-B: core rules from dbo.guard_rules (tier='core' AND prompt_text NOT NULL)
   const coreRulesPath = config.coreRulesPath || 'C:\\dsh-mem\\ops\\mem-core-rules.ps1'
-  // 2026-10-24 C4：混合检索（本地嵌入 bge-m3 via 18 的 Ollama；失败自动退化为纯 IDF）
+  // 2026-10-24 C4：混合检索（本地嵌入 bge-m3 via 模型机的 Ollama；失败自动退化为纯 IDF）
   const semanticOn    = config.semantic === false ? false : true
   const vectorPath    = config.vectorPath || 'C:\\dsh-mem\\mem-vectors.bin'
-  // [HYBRID-RECALL-20261123] [OPENSOURCE-20261124] 任务②：ollama 在 18（config.embed.baseURL=192.0.2.18:11434）；旧默认 127.0.0.1:11434（11 本机无 ollama）⇒ curl-fail ⇒ 向量分支永不生效、退化成纯 IDF。
+  // [HYBRID-RECALL-20261123] [OPENSOURCE-20261124] 任务②：ollama 在模型机（config.embed.baseURL=192.0.2.18:11434）；旧默认 127.0.0.1:11434（本机无 ollama）⇒ curl-fail ⇒ 向量分支永不生效、退化成纯 IDF。
   const ollamaUrl     = config.ollamaUrl || (config.embed && config.embed.baseURL) || 'http://127.0.0.1:11434'
   const embedModel    = config.embedModel || 'bge-m3'
   // 2026-10-25 r8（18 指出）：`injector=0.5.0` 从 r1 到 r7 一直没变 ⇒ **不携带"哪个 build"的信息**。
@@ -609,7 +609,7 @@ export function apply(ctx, config) {
       // ---- 关键约定：每次完整注入（不看新旧）----
       try {
         if (conventionsPath && existsSync(conventionsPath)) {
-          // 2026-10-24 r5：采纳 18 的运行时版本尾巴——从注入内容本身就能报出跑的是哪一版
+          // 2026-10-24 r5：采纳外部复核的运行时版本尾巴——从注入内容本身就能报出跑的是哪一版
         const convBuf = readFileSync(conventionsPath)
         const convSha16 = createHash('sha256').update(convBuf).digest('hex').slice(0, 16).toUpperCase()
         const convSize = convBuf.length
@@ -626,7 +626,7 @@ export function apply(ctx, config) {
       }
           if (conv.charCodeAt(0) === 0xFEFF) conv = conv.slice(1)
           conv = conv.trim()
-          // 2026-10-24 采纳 18 的复核意见：指针必须自证——别让注入指向不存在的文件
+          // 2026-10-24 采纳外部复核意见：指针必须自证——别让注入指向不存在的文件
           //   （"文档说有、机器上没有" = 清单有说的第四种形态）
           try {
             const detailRel = 'docs\\约定详情-完整版.md'
@@ -912,7 +912,7 @@ export function apply(ctx, config) {
   const timer = setInterval(refresh, refreshMs)
   if (typeof timer.unref === 'function') timer.unref()
 
-  // 2026-10-24 采纳 18 的建议：记录"选中哪个 + 跳过了哪些 + 内容校验"，而不只是"存在"
+  // 2026-10-24 采纳外部复核的建议：记录"选中哪个 + 跳过了哪些 + 内容校验"，而不只是"存在"
   try {
     const detailCheck = (function () {
       try {
