@@ -584,8 +584,11 @@ WHEN NOT MATCHED THEN INSERT (session_id, machine, cwd, title, event_count) VALU
   $script:State | Add-Member -NotePropertyName $SessionFile -NotePropertyValue $key -Force
   Save-State
   # [INCREMENTAL-20261118] 记录本次解压到的断点（增量或全量都更新）。
-  $script:Offsets | Add-Member -NotePropertyName $offKey -NotePropertyValue $newOffset -Force
-  Save-Offsets
+  # [DRYRUN-NOOFFSET-20261124] DryRun 是探测，不该推进增量断点。
+  if (-not $DryRun) {
+    $script:Offsets | Add-Member -NotePropertyName $offKey -NotePropertyValue $newOffset -Force
+    Save-Offsets
+  } else { Write-Host ("  [dry-run] offsets not saved (would be " + $newOffset + ")") }
 
   Write-Host ("  session : $sid")
   Write-Host ("  title   : $sessTitle")
@@ -918,7 +921,9 @@ function Update-MoodDrift {
   try {
     $mins = "DATEDIFF(MINUTE, updated_at, SYSUTCDATETIME())"
     $sql = "UPDATE dbo.agent_state SET value = CASE state_name " +
-      "WHEN 'boredom' THEN CASE WHEN value + 0.002 * $mins - 0.02 * $Activity > 1.0 THEN 1.0 " +
+  # [MOOD-SOFTTOP-20261124] boredom 天花板 1.0 -> 0.85：静默 8 小时会到 1.53，钳 1.0 等于"永远极度无聊"（语义失真）；
+  #   软顶 0.85 保留"很无聊"但不失真，且一有检索就 -0.02 回落。（这正是昨夜 0.0 反向对称问题）
+      "WHEN 'boredom' THEN CASE WHEN value + 0.002 * $mins - 0.02 * $Activity > 0.85 THEN 0.85 " +
       "WHEN value + 0.002 * $mins - 0.02 * $Activity < 0.10 THEN 0.10 " +
       "ELSE value + 0.002 * $mins - 0.02 * $Activity END " +
       "WHEN 'energy' THEN CASE WHEN value - 0.0001 * $mins - 0.001 * $mins + 0.02 * $Activity > 1.0 THEN 1.0 " +
@@ -1152,6 +1157,23 @@ function Invoke-SmartRewrite {
 switch ($Command.ToLower()) {
 
   'sync' {
+    # [FAILFAST-20261124] 启动即自检：缺 extractor / config 立即失败并给出非零退出码。
+    # 为什么：2026-11-24 实测 CliPath 换目录后 extractor 缺失，02:05 起约 126 次 sync 全 FAILED，
+    #   而 sync 行始终 exit=0 ⇒ 只能靠翻日志发现。这里把"缺依赖"变成"立刻红"，不再静默。
+    if (-not (Test-Path -LiteralPath $cfg.extractor)) {
+      Write-Host ("  FAILFAST: extractor not found -> " + $cfg.extractor)
+      Write-Host ("            sync cannot decompress session logs. Fix: put dsh-zstd-extract.js next to this script, or set 'extractor' in dsh-mem.config.json")
+      exit 2
+    }
+    if (-not (Test-Path -LiteralPath $CfgPath)) {
+      Write-Host ("  FAILFAST: config not found -> " + $CfgPath); exit 2
+    }
+    if (-not (Test-Path -LiteralPath $script:StatePath)) {
+      Write-Host ("  [WARN] state file missing: " + $script:StatePath + " (created on first successful sync)")
+    }
+    if ($DryRun) {
+      Write-Host "  [WARN][DRYRUN-NOOFFSET-20261124] -DryRun only suppresses the offsets write; DB upserts and state writes STILL happen. Do not treat ""sync -DryRun"" as a read-only probe."
+    }
     if ($All) {
       $files = Get-ChildItem $cfg.sessionsRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
                Where-Object { $_.Name -like '*.jsonl.zstd' }
