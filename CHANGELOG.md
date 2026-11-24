@@ -5,8 +5,8 @@
 > - `packages/memory/plugin` 的**「组件版本」**（0.5.x）见 `packages/memory/plugin/CHANGELOG.md`。
 > - 两者不同步递增：插件升级不一定伴随仓库发版，别把组件版本当仓库版本读。
 >
-> 插件侧最近一次升级至 **dsh-memory-bridge 0.5.1**（state card / anchor 指针两段注入、`cliPath` 缺失不再静默回退、
-> `verify.mjs` 改用 no-op stub、补齐 `package.json` files 清单）——详细条目见上述组件 CHANGELOG。
+> 插件侧组件变更（最新条目 **0.5.4**）：0.5.1 引入 state card / anchor 指针两段注入，并修复 `cliPath` 缺失静默回退与 `verify.mjs` 自测；
+> 0.5.3 / 0.5.4 为实时同步与 spool 捕获补全 —— 详细条目见上述组件 CHANGELOG。
 
 ## [0.1.6] — 2026-11-24
 
