@@ -61,7 +61,10 @@ if (-not $SkipDdl) {
 
 Say '4/5 安装记忆注入插件（link 到本仓库）'
 $pluginSrc = Resolve-Path (Join-Path $PSScriptRoot '..\packages\memory\plugin')
-$profileDir = Join-Path $env:USERPROFILE '.dsh\profiles\desktop'
+# [DSHHOME-20261124] DSH_HOME 自定义时（如 D:\dsh-home），store 不在 %USERPROFILE%\.dsh，
+#   硬编码路径会把插件 link 到一个没人读的位置 ⇒ 先把根算出来
+$dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
+$profileDir = Join-Path $dshHome 'profiles\desktop'
 $nm = Join-Path $profileDir 'node_modules'
 New-Item -ItemType Directory -Path $nm -Force | Out-Null
 $target = Join-Path $nm 'dsh-memory-bridge'

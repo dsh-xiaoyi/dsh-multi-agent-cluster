@@ -4,13 +4,17 @@
 # 只读检查，不修改任何东西。任何一项失败都会打印原因并计入 FAIL。
 param(
     [string]$ConfigPath = 'C:\dsh-mem\dsh-mem.config.json',
-    [int]$MaxReplicaMinutes = 30
+    [int]$MaxReplicaMinutes = 30,
+    # [SKIP-NOT-FAIL-20261124] 安装时主动精简（不装插件 / 不配副本）属正常做法，
+    #   体检应报 SKIP 而不是 FAIL，否则现场会把"主动精简安装"误判成"装坏了"
+    [switch]$AllowIncomplete
 )
 $ErrorActionPreference = 'Continue'
 $fail = 0
 function Ok($m)   { Write-Output ('[PASS] ' + $m) }
 function Bad($m)  { Write-Output ('[FAIL] ' + $m); $script:fail++ }
 function Info($m) { Write-Output ('[INFO] ' + $m) }
+function Skip($m) { Write-Output ('[SKIP] ' + $m) }
 if (-not (Get-Command sqlcmd -ErrorAction SilentlyContinue)) { Info '没有找到 sqlcmd（可不影响本体检，但建库/恢复演练会用到）' }
 if (-not (Get-Command node   -ErrorAction SilentlyContinue)) { Info '没有找到 node（青鸟与注入插件需要 Node.js）' }
 
@@ -39,12 +43,20 @@ if ($rp -and (Test-Path $rp)) {
     $age = ((Get-Date) - (Get-Item $rp).LastWriteTime).TotalMinutes
     if ($age -le $MaxReplicaMinutes) { Ok ('离线副本新鲜（' + [int]$age + ' 分钟前）') }
     else { Bad ('离线副本过期（' + [int]$age + ' 分钟）') }
-} else { Bad ('离线副本不存在: ' + $rp) }
+} else {
+    # [SKIP-NOT-FAIL-20261124] 没配副本 / 副本不存在，在 -AllowIncomplete 下记 SKIP 而不是 FAIL
+    if ($AllowIncomplete) { Skip ('离线副本未配置或不存在（已声明精简安装）: ' + $rp) }
+    else { Bad ('离线副本不存在: ' + $rp) }
+}
 
 # 4) 注入插件是否装了
-$profileDir = Join-Path $env:USERPROFILE '.dsh\profiles\desktop'
+# [DSHHOME-20261124] 与 install.ps1 同源：DSH_HOME 自定义时插件不在 %USERPROFILE%\.dsh
+$dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
+$profileDir = Join-Path $dshHome 'profiles\desktop'
 $plugin = Join-Path $profileDir 'node_modules\dsh-memory-bridge\index.mjs'
-if (Test-Path $plugin) { Ok ('注入插件存在: ' + $plugin) } else { Bad '注入插件未安装（见 ops\install.ps1 第 4 步）' }
+if (Test-Path $plugin) { Ok ('注入插件存在: ' + $plugin) }
+elseif ($AllowIncomplete) { Skip '注入插件未安装（已声明精简安装）' }
+else { Bad '注入插件未安装（见 ops\install.ps1 第 4 步）' }
 
 # 5) DSH 端口（只发现）
 $procs = @(Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue)

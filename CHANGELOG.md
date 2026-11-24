@@ -1,29 +1,66 @@
 # 变更记录
 
-## [0.5.2] — 2026-10-25（memory 插件升级）
-### 修复（发布前自测拦下的两个真问题）
+> **版本口径（2026-11-24 补）**
+> - **本文件记的是「仓库版本」**（v0.1.x）：整棵树，含记忆引擎 / 青鸟 / 时光守护 / 文档。
+> - `packages/memory/plugin` 的**「组件版本」**（0.5.x）见 `packages/memory/plugin/CHANGELOG.md`。
+> - 两者不同步递增：插件升级不一定伴随仓库发版，别把组件版本当仓库版本读。
+>
+> 插件侧最近一次升级至 **dsh-memory-bridge 0.5.1**（state card / anchor 指针两段注入、`cliPath` 缺失不再静默回退、
+> `verify.mjs` 改用 no-op stub、补齐 `package.json` files 清单）——详细条目见上述组件 CHANGELOG。
 
-- `packages/memory/plugin` 同步了 0.5.1 的两处修复：
-  **显式 `cliPath` 缺失不再静默回退**（记 `CLI-MISSING`、拒绝执行）+
-  **`verify.mjs` 改用临时 no-op stub CLI**（自测稳定 PASS，且不再写任何数据库）。
-- 补齐了 `package.json` 里 `files` 清单缺失的 4 个文件（否则 `npm pack` 出来的包不完整）。
+## [0.1.6] — 2026-11-24
 
+### 记忆：批次4
+- 召回池与「最近结论」共用同一套排除判定，审计条目与压缩摘要不再从任一侧漏进结果
+- 情绪状态软顶 1.0 → 0.85，静默过久不再钉在天花板
+- 启动即自检：缺解压器或配置立即失败并给出非零退出码，不再静默返回成功
+- 试运行（`-DryRun`）不写断点，只打印将写入的值
+- 增量解压器 `dsh-zstd-extract.js` 支持按字节偏移恢复（`--from`）；**引擎的增量调用尚未接入，当前仍为全量解压**
 
-- `packages/memory/plugin` 升级到 **dsh-memory-bridge 0.5.1**：新增
-  **state card**（跨会话工作状态）与 **anchor 指针**（可回读的 session+seq）两段注入，
-  `SEC_BUDGET`/`BUDGET_FLOOR` 随之再平衡（state 2400 / anchor 900，各段设下限）。
-- 对外示例已脱敏：默认 `ollamaUrl` 改为 `127.0.0.1`，文案不再含具体主机名/GPU 型号；
-  文档中的示例路径统一为 `C:\Users\<用户名>`；`packages/bridge/plugin/cordis.patch.yml`
-  的白名单示例主机名改为 `<agent-host>`。
-## v0.1.0 (2026-10-23) — 首发（experimental）
+### 安装与体检
+- `ops/doctor.ps1` 新增 `-AllowIncomplete`：主动精简安装（不装插件 / 不配副本）记 `SKIP` 而不是 `FAIL`
+- `ops/install.ps1` / `ops/doctor.ps1`：`DSH_HOME` 自定义时插件路径跟随，不再硬编码 `%USERPROFILE%\.dsh`
+- 本仓记忆引擎为 **SQL Server 单方言**：本批 MySQL / SQLite 方言修复（排序规则、NUL 转义、断点跨库、SQLite 卡死）**不在本仓范围**，见「记忆旧时光」仓
+
+## [0.1.5] — 2026-11-24
+
+### 记忆与检索升级
+- `-Smart` LLM 查询改写（主备模型，失败回退字面）
+- 向量候选集：语义检索只取候选区间，内存占用大幅下降
+- `text_hash1200` 列 + 非聚簇索引：按哈希列定位消息，避免全表逐行计算
+- 语义检索单遍直填；注入器关键词与向量混合召回
+- 情绪四维双向校准；审计条目治理（独立分类，召回池与排序排除）
+
+## [0.1.4] — 2026-11-23
+
+### 记忆检索改进
+- 访问加固（命中计数 + 按热度排序）、情绪与处境标注（`valence` / `context`）
+- 共现互链（`memory_refs`）、情绪状态命令（`mood`）、全文检索
+
+## [0.1.3] — 2026-11-06
+
+### 同步 11-06 更新
+- 注入缓存化、资源门禁、值守巡检、端口守卫
+
+## [0.1.2] — 2026-10-26
+
+### 引擎对齐
+- 集群仓记忆引擎对齐运行时 SQL Server 版
+
+## [0.1.1] — 2026-10-25
+
+### 修复
+- 刚写入的 spool 行不再被同步对账误删（批量同步与实时通道共存）
+- 记忆插件同步到当时的组件版本
+
+## [0.1.0] — 2026-10-23 · 首发（experimental）
 
 ### 新增
-- **记忆旧时光**：引擎（save/search/recent/sync/backup/replica/history）、12 个 SQL 结构脚本、注入插件（v3/IDF）
+- **记忆旧时光**：引擎（save/search/recent/sync/backup/replica/history）、12 个 SQL 结构脚本、注入插件
 - **青鸟**：DSH 插件（入站注入 + 队列轮询 + peer 令牌）、发送脚本、验证脚本
-- **时光守护**：表驱动规则引擎、30 项体检、L1 跨机互监心跳、一键恢复脚本、周包检查
-- **文档**：00-why（为什么做）、01-architecture（三中枢架构）、02-memory-design（记忆设计，含三层缺陷复盘）、
-  03-conventions（运维纪律）、04-postmortems（复盘集）、05-recovery-drill（恢复演练）、06-rescue（故障自诊与回滚）、winrm（WinRM 基线）、07-file-map（文件地图）、08-permissions-and-antivirus（权限与安全软件拦截）
-- **工具**：`ops\secret-scan.ps1`（发布前必跑）、`ops\install.ps1`、`ops\doctor.ps1`
+- **时光守护**：表驱动规则引擎、体检、L1 跨机互监心跳、一键恢复脚本、周包检查
+- **文档**：架构 / 记忆设计 / 运维纪律 / 复盘集 / 恢复演练 / 故障自诊 / 文件地图 / 权限与安全软件
+- **工具**：`ops/secret-scan.ps1`（发布前必跑）、`ops/install.ps1`、`ops/doctor.ps1`
 
 ### 明确不含
 - 任何真实环境数据（记忆库内容、对话、主机信息）
