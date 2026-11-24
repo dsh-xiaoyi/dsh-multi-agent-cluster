@@ -14,6 +14,12 @@
 - 两者**不同源，不可互相覆盖**；文件首行已加 [DIVERGENT-SOURCES-20261124] 声明。
 - 跨仓同步时请按各自版本移植改动，不要整份替换。
 
+## [0.1.8] — 2026-11-24
+
+- 插件源码与「记忆旧时光」归一为同一份（组件版本 0.5.6）：`packages/memory/plugin/index.mjs` 两仓逐字节相同
+- `ops/install.ps1`、`ops/doctor.ps1` 按本仓（SQL Server 单方言精简版）移植两处修复，并声明与另一仓同名文件**不同源、不可互相覆盖**
+- CHANGELOG 补齐历史版本条目；新增 `.gitattributes`，换行由仓库声明决定，不再随环境漂移
+
 ## [0.1.7] — 2026-11-24
 
 - `ops/install.ps1`、`ops/doctor.ps1` 按本仓（SQL Server 单方言精简版）移植两处修复，并加 `[DIVERGENT-SOURCES-20261124]` 声明：「与 jiyijiushiguang 同名文件不同源，不可互相覆盖」
